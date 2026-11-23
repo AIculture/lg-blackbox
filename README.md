@@ -21,7 +21,9 @@ Current version: **1.13.0**. Admin page: **Tools > LG Black Box**.
 
 ## Install
 
-The folder name must be `lg-blackbox`.
+**Quick install:** download [`lg-blackbox.zip`](lg-blackbox.zip) (open it on GitHub and press Download raw file), then in WordPress go to Plugins > Add New > Upload Plugin, choose the zip, install and activate. The zip is built from the files in this repo and already has the `lg-blackbox/` folder WordPress expects. To rebuild it after changing a file, run `build-zip.ps1` (PowerShell) and commit the new zip.
+
+**Manual install:** the folder name must be `lg-blackbox`.
 
 1. Put `gate.php`, `lg-blackbox.php`, `probe.php` and `assets/` in `wp-content/plugins/lg-blackbox/` (upload only these files, not a whole development folder).
 2. Activate it, then open **Tools > LG Black Box**.
