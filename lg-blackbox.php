@@ -1,19 +1,20 @@
 <?php
 /*
-Plugin Name: LG Black Box (server diagnostics)
-Description: Flight recorder for hosting incidents. Samples server load, memory, per-process RSS and MariaDB state every ~30 s, logs slow/heavy requests and cron hooks, detects database restarts, and records the server state while the database is down. Read-only; safe to deactivate and delete.
-Version: 1.13.0
+Plugin Name: LG Black Box (server diagnostics, multi-tenant CRM)
+Description: Flight recorder and shield for the multi-tenant CRM host. Samples server load, memory, per-process RSS and MariaDB state every ~30 s, logs slow/heavy requests (tagged with the tenant they ran for) and cron hooks, detects database restarts, records every request compactly to spot bot bursts, and can refuse brute-force logins, off-country logins and scanner probes before WordPress loads. Safe to deactivate and delete.
+Version: 2.3.2
 Author: Les Gouttières
 */
 
 if (!defined('ABSPATH'))
     exit;
 
-define('LG_BB_VERSION', '1.13.0');
+define('LG_BB_VERSION', '2.3.2');
 define('LG_BB_PROBE', plugin_dir_path(__FILE__) . 'probe.php');
 require_once LG_BB_PROBE;
+require_once plugin_dir_path(__FILE__) . 'security.php';
 
-// Thresholds — override in wp-config.php with define() if too noisy / too quiet.
+// Thresholds - override in wp-config.php with define() if too noisy / too quiet.
 if (!defined('LG_BB_SLOW_S'))
     define('LG_BB_SLOW_S', 3.0);          // log requests slower than this
 if (!defined('LG_BB_HEAVY_MB'))
@@ -31,11 +32,11 @@ if (!defined('SAVEQUERIES') && get_option('lg_bb_savequeries')) {
 
 // ---------------------------------------------------------------- time display
 
-/** Every time shown on the page and in the report is Eastern (Toronto), whatever the site timezone is. */
+/** Every time shown on the page and in the report is Eastern (Toronto), whatever the site timezone is. define('LG_BB_TZ', 'Zone/Name') in wp-config.php to change it. */
 function lg_bb_tz()
 {
     try {
-        return new DateTimeZone('America/Toronto');
+        return new DateTimeZone(defined('LG_BB_TZ') ? (string) LG_BB_TZ : 'America/Toronto');
     } catch (\Throwable $e) {
         return wp_timezone();
     }
@@ -46,10 +47,10 @@ function lg_bb_date($format, $t = null)
     return wp_date($format, $t === null ? time() : (int) $t, lg_bb_tz());
 }
 
-/** "America/Toronto, EST" / "EDT" — the label printed next to times. */
+/** "America/Toronto, EST" / "EDT" - the label printed next to times. */
 function lg_bb_tz_label()
 {
-    return 'America/Toronto, ' . lg_bb_date('T');
+    return lg_bb_tz()->getName() . ', ' . lg_bb_date('T');
 }
 
 // ---------------------------------------------------------------- paths
@@ -117,22 +118,99 @@ function lg_bb_label()
     return $extra ? $out . '?' . implode('&', $extra) : $out;
 }
 
+/**
+ * Is the TCP peer (REMOTE_ADDR) a proxy whose forwarded headers may be believed? Same rule as the CRM's own
+ * CRM_Rate_Limit::client_ip(): loopback / private addresses (nginx or Varnish on the same box), or an address
+ * or CIDR listed in the LG_CRM_TRUSTED_PROXIES constant (array or comma separated string; Cloudflare's ranges
+ * when PHP sees them as the peer). Anyone can send CF-Connecting-IP / X-Forwarded-For / CF-IPCountry, so
+ * believing them from an untrusted peer lets an attacker pick the IP that gets blocked, or dodge a block.
+ */
+function lg_bb_peer_trusted($peer)
+{
+    if (!filter_var($peer, FILTER_VALIDATE_IP)) {
+        return false;
+    }
+    if (!filter_var($peer, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+        return true;
+    }
+    if (!defined('LG_CRM_TRUSTED_PROXIES')) {
+        return false;
+    }
+    $list = LG_CRM_TRUSTED_PROXIES;
+    if (is_string($list)) {
+        $list = array_map('trim', explode(',', $list));
+    }
+    $pb = @inet_pton($peer);
+    foreach ((array) $list as $entry) {
+        $entry = (string) $entry;
+        if ($entry === '') {
+            continue;
+        }
+        if (strpos($entry, '/') === false) {
+            if ($peer === $entry) {
+                return true;
+            }
+            continue;
+        }
+        list($net, $bits) = explode('/', $entry, 2);
+        $nb = @inet_pton($net);
+        $bits = (int) $bits;
+        if ($pb === false || $nb === false || strlen($pb) !== strlen($nb) || $bits < 0 || $bits > strlen($pb) * 8) {
+            continue;
+        }
+        $bytes = intdiv($bits, 8);
+        if ($bytes > 0 && strncmp($pb, $nb, $bytes) !== 0) {
+            continue;
+        }
+        $rem = $bits % 8;
+        if ($rem === 0 || (ord($pb[$bytes]) & ((0xFF << (8 - $rem)) & 0xFF)) === (ord($nb[$bytes]) & ((0xFF << (8 - $rem)) & 0xFF))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Visitor IP: the forwarded header when the peer is a trusted proxy, otherwise the peer itself. */
 function lg_bb_ip()
 {
-    foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR'] as $k) {
-        if (!empty($_SERVER[$k])) {
-            $ip = trim(explode(',', (string) $_SERVER[$k])[0]);
-            if (filter_var($ip, FILTER_VALIDATE_IP)) {
-                return $ip;
+    $peer = isset($_SERVER['REMOTE_ADDR']) ? trim((string) $_SERVER['REMOTE_ADDR']) : '';
+    if (lg_bb_peer_trusted($peer)) {
+        foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR'] as $k) {
+            if (!empty($_SERVER[$k])) {
+                $ip = trim(explode(',', (string) $_SERVER[$k])[0]);
+                if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                    return $ip;
+                }
             }
         }
     }
-    return '';
+    return filter_var($peer, FILTER_VALIDATE_IP) ? $peer : '';
 }
 
-/** Visitor country as reported by Cloudflare (CF-IPCountry): 2 letters, XX = unknown, T1 = Tor, '' = header absent. */
+/** What the page shows next to "your IP": the peer, whether it is trusted, and forwarded headers that were ignored. */
+function lg_bb_ip_diag()
+{
+    $peer = isset($_SERVER['REMOTE_ADDR']) ? trim((string) $_SERVER['REMOTE_ADDR']) : '';
+    $trusted = lg_bb_peer_trusted($peer);
+    $fwd = false;
+    foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR'] as $k) {
+        if (!empty($_SERVER[$k])) {
+            $h = trim(explode(',', (string) $_SERVER[$k])[0]);
+            if (filter_var($h, FILTER_VALIDATE_IP) && $h !== $peer) {
+                $fwd = true; // names a different address than the peer: a real proxy hop we are not believing
+            }
+        }
+    }
+    return ['peer' => $peer, 'trusted' => $trusted, 'ignored' => $fwd && !$trusted];
+}
+
+/** Visitor country as reported by Cloudflare (CF-IPCountry): 2 letters, XX = unknown, T1 = Tor, '' = header absent or not believable. */
 function lg_bb_cc()
 {
+    $peer = isset($_SERVER['REMOTE_ADDR']) ? trim((string) $_SERVER['REMOTE_ADDR']) : '';
+    if (!lg_bb_peer_trusted($peer)) {
+        return '';
+    }
     $c = isset($_SERVER['HTTP_CF_IPCOUNTRY']) ? strtoupper(trim((string) $_SERVER['HTTP_CF_IPCOUNTRY'])) : '';
     return preg_match('/^[A-Z0-9]{2}$/', $c) ? $c : '';
 }
@@ -200,15 +278,67 @@ function lg_bb_ua_short($ua)
     return $ua === '' ? '-' : substr($ua, 0, 24);
 }
 
+// ---------------------------------------------------------------- tenants (multi-tenant CRM)
+
+/** Tenant id the CRM resolved for THIS request (JWT, webhook slug, signed link), or 0 when none was set. */
+function lg_bb_current_tenant()
+{
+    if (!class_exists('CRM_Context')) {
+        return 0;
+    }
+    try {
+        return (int) CRM_Context::tenant_id_or_throw();
+    } catch (\Throwable $e) {
+        return 0; // not set: the request never identified a tenant (anonymous, login, static)
+    }
+}
+
+/**
+ * "12 Confort CB" for a tenant id, "slug (Name)" for a slug. Falls back to the bare id / slug when the CRM plugin
+ * is not loaded or the tenant is gone, so the report always prints something.
+ */
+function lg_bb_tenant_label($key)
+{
+    static $cache = [];
+    $key = (string) $key;
+    if (isset($cache[$key])) {
+        return $cache[$key];
+    }
+    $label = $key;
+    if (class_exists('CRM_Repo_Tenants')) {
+        try {
+            if (ctype_digit($key)) {
+                $t = CRM_Repo_Tenants::get((int) $key);
+                $label = is_array($t) && !empty($t['name']) ? $key . ' ' . trim(preg_replace('/[|\s]+/', ' ', (string) $t['name'])) : 'tenant ' . $key;
+            } else {
+                $t = CRM_Repo_Tenants::get_by_slug($key);
+                $label = is_array($t) && !empty($t['name']) ? $key . ' (' . trim(preg_replace('/[|\s]+/', ' ', (string) $t['name'])) . ')' : $key;
+            }
+        } catch (\Throwable $e) {
+            // the lookup must never break the page or the report
+        }
+    } elseif (ctype_digit($key)) {
+        $label = 'tenant ' . $key;
+    }
+    return $cache[$key] = $label;
+}
+
 // ---------------------------------------------------------------- burst recorder
 //
 // One tiny line per request that reaches WordPress, written when the request STARTS (so a request
 // that is later killed is still there): who (IP, country, client type), what (path with long ids
 // masked, the NAMES of query parameters, never their values) and where from (referring host).
 // The slow-request log only sees requests that were already slow; this one shows the quiet start
-// of a burst and which clients made it. Rolling file, ~8 MB total (two files of 4 MB).
+// of a burst and which clients made it. Rolling file, ~8 MB total (two files of 4 MB; define('LG_BB_REC_MAX', bytes)
+// in wp-config.php for a longer memory, the CRM's own polling fills it quickly on a busy day).
+//
+// Multi-tenant: 'a' = the request carried a Bearer token on a CRM API path (a logged-in CRM user or app, not an
+// anonymous bot; the token is NOT checked, this only separates polling from the rest), 'tn' = the tenant slug when
+// the path names one (/lg-crm/v1/t/{slug}/..., the Twilio / receipt webhooks).
 
-define('LG_BB_REC_MAX', 4194304);
+if (!defined('LG_BB_REC_MAX')) {
+    define('LG_BB_REC_MAX', 4194304);
+}
 
 function lg_bb_rec_file($rotated = false)
 {
@@ -254,6 +384,14 @@ function lg_bb_rec_start()
     $row['ua'] = lg_bb_ua_short(isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '');
     $row['m'] = isset($_SERVER['REQUEST_METHOD']) ? substr((string) $_SERVER['REQUEST_METHOD'], 0, 1) : '?';
     $row['p'] = substr($path, 0, 90);
+    $route = $path . ' ' . (isset($_GET['rest_route']) && is_string($_GET['rest_route']) ? $_GET['rest_route'] : '');
+    if (preg_match('#/lg-crm/v1/t/([a-z0-9_-]{1,32})/#i', $route, $tm)) {
+        $row['tn'] = strtolower($tm[1]);
+    }
+    $bearer = !empty($_SERVER['HTTP_AUTHORIZATION']) ? (string) $_SERVER['HTTP_AUTHORIZATION'] : (!empty($_SERVER['REDIRECT_HTTP_AUTHORIZATION']) ? (string) $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] : '');
+    if ($bearer !== '' && stripos($bearer, 'bearer ') === 0 && strpos($route, '/lg-crm/v1/') !== false && strpos($route, '/auth/') === false) {
+        $row['a'] = 1;
+    }
     $q = parse_url($uri, PHP_URL_QUERY);
     if (is_string($q) && $q !== '' && preg_match_all('/(?:^|&)([^=&]{1,24})/', $q, $m)) {
         $keys = [];
@@ -280,7 +418,7 @@ function lg_bb_rec_summary($hours)
         return $cache[$key];
     }
     $since = time() - $hours * 3600;
-    $S = ['n' => 0, 't0' => 0, 't1' => 0, 'min' => [], 'cl' => [], 'qk' => [], 'ad' => 0, 'fb' => 0, 'ty' => []];
+    $S = ['n' => 0, 't0' => 0, 't1' => 0, 'min' => [], 'cl' => [], 'qk' => [], 'ad' => 0, 'fb' => 0, 'ty' => [], 'au' => 0, 'tn' => []];
     foreach ([lg_bb_rec_file(true), lg_bb_rec_file()] as $file) {
         $h = @fopen($file, 'r');
         if (!$h) {
@@ -310,6 +448,13 @@ function lg_bb_rec_summary($hours)
             $S['t1'] = max($S['t1'], $t);
             $S['ad'] += $ad;
             $S['fb'] += $fb;
+            $S['au'] += !empty($r['a']) ? 1 : 0;
+            if (!empty($r['tn'])) {
+                $tk = (string) $r['tn'];
+                if (isset($S['tn'][$tk]) || count($S['tn']) < 200) {
+                    $S['tn'][$tk] = (isset($S['tn'][$tk]) ? $S['tn'][$tk] : 0) + 1;
+                }
+            }
             // Client TYPE roll-up: ad clickers arrive from thousands of different IPs, so per-IP rows hide them.
             if (isset($S['ty'][$ua]) || count($S['ty']) < 200) {
                 if (!isset($S['ty'][$ua])) {
@@ -402,7 +547,15 @@ function lg_bb_rec_report($hours, $inc)
     }
     $span = max(1, ($S['t1'] - $S['t0']) / 60);
     $L[] = '== ALL PHP REQUESTS (burst recorder' . (lg_bb_rec_on() ? '' : ', now OFF') . '): ' . lg_bb_date('m-d H:i', $S['t0']) . ' -> ' . lg_bb_date('m-d H:i', $S['t1']) . ', ' . $S['n'] . ' requests (avg ' . round($S['n'] / $span, 1) . '/min), '
-        . $S['ad'] . ' with ad-click parameters (fbclid/gclid/utm_*), ' . $S['fb'] . ' from Facebook/Instagram/Meta ==';
+        . $S['ad'] . ' with ad-click parameters (fbclid/gclid/utm_*), ' . $S['fb'] . ' from Facebook/Instagram/Meta, '
+        . $S['au'] . ' (' . round($S['au'] * 100 / $S['n']) . '%) CRM API calls carrying a Bearer token (logged-in app traffic, the rest is anonymous) ==';
+    if ($S['tn']) {
+        $tn = [];
+        foreach (lg_bb_rec_top($S['tn'], 8) as $k => $c) {
+            $tn[] = lg_bb_tenant_label($k) . ' x' . $c;
+        }
+        $L[] = 'tenant webhook traffic (paths /lg-crm/v1/t/{slug}/...): ' . implode(', ', $tn);
+    }
     $qk = [];
     foreach (lg_bb_rec_top($S['qk'], 8) as $k => $c) {
         $qk[] = $k . ' x' . $c;
@@ -503,7 +656,7 @@ $GLOBALS['lg_bb'] = [
 
 // "In flight" marker: a tiny file that exists while a request runs. A request that
 // is killed by the host (OOM killer, FPM terminate timeout) never reaches shutdown,
-// so its marker is left behind — that is how killed requests are found afterwards.
+// so its marker is left behind - that is how killed requests are found afterwards.
 if (PHP_SAPI !== 'cli') {
     $lg_bb_label = lg_bb_label();
     $GLOBALS['lg_bb']['label'] = $lg_bb_label;
@@ -634,6 +787,10 @@ function lg_bb_shutdown()
             'ua' => isset($_SERVER['HTTP_USER_AGENT']) ? substr((string) $_SERVER['HTTP_USER_AGENT'], 0, 80) : '',
             'u' => function_exists('get_current_user_id') ? get_current_user_id() : 0,
         ];
+        $tn = lg_bb_current_tenant();
+        if ($tn > 0) {
+            $row['tn'] = $tn;
+        }
         if ($b['cron']) {
             $row['cron'] = $b['cron'];
         }
@@ -832,7 +989,7 @@ function lg_bb_auth_str($a)
 
 /**
  * Counts running requests and settles the leftovers: a marker whose PHP worker no
- * longer exists belongs to a request that was killed — logged once as 'orphan'.
+ * longer exists belongs to a request that was killed - logged once as 'orphan'.
  */
 function lg_bb_inflight_scan()
 {
@@ -905,7 +1062,7 @@ function lg_bb_install_dropin()
     if (file_exists($target) && strpos((string) @file_get_contents($target), 'LG-BLACKBOX-DROPIN') === false) {
         return false;
     }
-    $code = "<?php\n/* LG-BLACKBOX-DROPIN v1 — installed by the LG Black Box plugin, removed when it is deactivated. */\n"
+    $code = "<?php\n/* LG-BLACKBOX-DROPIN v1 - installed by the LG Black Box plugin, removed when it is deactivated. */\n"
         . '$lg_bb_probe = ' . var_export(LG_BB_PROBE, true) . ";\n"
         . '$lg_bb_log = ' . var_export(lg_bb_logfile(), true) . ";\n"
         . <<<'PHP'
@@ -969,7 +1126,17 @@ function lg_bb_rl_dir()
 {
     $d = lg_bb_dir() . '/rl';
     if (!is_dir($d)) {
-        @mkdir($d, 0755, true);
+        @mkdir($d, 0775, true);
+    }
+    // Group-writable, once per request: the server's block-list sync script (a different system user in the same group)
+    // writes shared entries here. Files in it are still only readable as before.
+    static $opened = false;
+    if (!$opened) {
+        $opened = true;
+        $p = @fileperms($d);
+        if ($p !== false && ($p & 0020) === 0) {
+            @chmod($d, 0775);
+        }
     }
     return $d;
 }
@@ -992,7 +1159,9 @@ function lg_bb_rl_write($f, $a)
 function lg_bb_rl_cfg()
 {
     $d = ['enabled' => 0, 'limit' => 8, 'window' => 10, 'block' => 30, 'block_xmlrpc' => 0, 'geo' => 'off', 'geo_countries' => ['CA', 'US'],
-        'probe' => 'off', 'probe_limit' => 5, 'probe_window' => 10, 'probe_block' => 60, 'static' => 0, 'static_forms' => 1];
+        'probe' => 'off', 'probe_limit' => 5, 'probe_window' => 10, 'probe_block' => 60, 'auto' => 0, 'auto_days' => 30,
+        'rate' => 0, 'rate_limit' => 120, 'rate_limit_auth' => 600, 'rate_limit_bot' => 20, 'rate_auto_days' => 1, 'cron_guard' => 0,
+        'ua' => null, 'ua_load' => 3.0]; // ua null = under-attack mode follows the rate limit
     $c = lg_bb_rl_read(lg_bb_rl_dir() . '/config.php');
     $c = is_array($c) ? array_merge($d, $c) : $d;
     if (empty($c['geo_countries']) || !is_array($c['geo_countries'])) {
@@ -1014,10 +1183,140 @@ function lg_bb_probe_on()
 }
 
 /** The gate file must exist while ANY of its three features is switched on. */
+function lg_bb_over_file($ip)
+{
+    return lg_bb_rl_dir() . '/over-' . substr(sha1($ip), 0, 20) . '.php';
+}
+
+/** IPs the rate limiter refused in the last hour: ip, minutes over the limit, last time, path. Old ones are removed. */
+function lg_bb_over_list()
+{
+    $rows = [];
+    foreach ((array) @glob(lg_bb_rl_dir() . '/over-*.php') as $f) {
+        $r = lg_bb_rl_read($f);
+        if (!is_array($r) || empty($r['ip']) || (int) $r['last'] < time() - 86400) {
+            @unlink($f);
+            continue;
+        }
+        $rows[] = $r;
+    }
+    usort($rows, function ($a, $b) {
+        return (int) $b['last'] - (int) $a['last'];
+    });
+    return $rows;
+}
+
+function lg_bb_auto_file($ip)
+{
+    return lg_bb_rl_dir() . '/auto-' . substr(sha1($ip), 0, 20) . '.php';
+}
+
+/** An IP that has made logged-in CRM API calls (seen in the request recorder) is never auto-blocked. */
+function lg_bb_auto_known_good($ip)
+{
+    $needle = '"ip":' . json_encode($ip);
+    foreach ([lg_bb_rec_file(true), lg_bb_rec_file()] as $f) {
+        $h = @fopen($f, 'r');
+        if (!$h) {
+            continue;
+        }
+        while (($line = fgets($h)) !== false) {
+            if (strpos($line, $needle) !== false && strpos($line, '"a":1') !== false) {
+                fclose($h);
+                return true;
+            }
+        }
+        fclose($h);
+    }
+    return false;
+}
+
+/** Add an IP to the automatic block list (used after repeated login lockouts; the gate adds repeat scanners itself). */
+function lg_bb_auto_add($ip, $why)
+{
+    $cfg = lg_bb_rl_cfg();
+    if (empty($cfg['auto']) || !lg_bb_rl_public_ip($ip)) {
+        return false;
+    }
+    $lists = lg_bb_rl_lists();
+    if (in_array($ip, $lists['allow'], true) || is_file(lg_bb_auto_file($ip)) || lg_bb_sec_is_self($ip) || lg_bb_auto_known_good($ip)) {
+        return false;
+    }
+    $many = @glob(lg_bb_rl_dir() . '/auto-*.php');
+    if ($many && count($many) >= 500) {
+        return false;
+    }
+    $now = time();
+    lg_bb_rl_write(lg_bb_auto_file($ip), ['ip' => $ip, 'cc' => lg_bb_cc(), 'why' => $why, 'first' => $now, 'last' => 0, 'n' => 0, 'until' => $now + max(1, (int) $cfg['auto_days']) * 86400]);
+    return true;
+}
+
+/** Active automatic blocks, newest first; expired ones are removed here. */
+function lg_bb_auto_list()
+{
+    $rows = [];
+    foreach ((array) @glob(lg_bb_rl_dir() . '/auto-*.php') as $f) {
+        $r = lg_bb_rl_read($f);
+        if (!is_array($r) || empty($r['ip']) || (int) $r['until'] <= time()) {
+            @unlink($f);
+            continue;
+        }
+        $rows[] = $r;
+    }
+    usort($rows, function ($a, $b) {
+        return (int) $b['first'] - (int) $a['first'];
+    });
+    return $rows;
+}
+
+/**
+ * The server's own public addresses, kept in rl/self.php for the gate (its own cron and loopback requests must never be refused).
+ * Behind Apache PHP sees SERVER_ADDR = 127.0.0.1, so the address comes from the site's DNS name (and the hostname). Refreshed every 6 hours,
+ * and only on a site that already has a Black Box configuration.
+ */
+add_action('init', function () {
+    $dir = lg_bb_rl_dir();
+    if (!is_file($dir . '/config.php')) {
+        return;
+    }
+    $f = $dir . '/self.php';
+    if (is_file($f) && filemtime($f) > time() - 6 * 3600) {
+        return;
+    }
+    $ips = [];
+    $host = wp_parse_url(home_url(), PHP_URL_HOST);
+    foreach ([is_string($host) ? gethostbyname($host) : '', isset($_SERVER['SERVER_ADDR']) ? (string) $_SERVER['SERVER_ADDR'] : '', gethostbyname((string) gethostname())] as $c) {
+        if (filter_var($c, FILTER_VALIDATE_IP) && lg_bb_rl_public_ip($c) && !in_array($c, $ips, true)) {
+            $ips[] = $c;
+        }
+    }
+    lg_bb_rl_write($f, ['ips' => $ips, 't' => time()]);
+}, 2);
+
+/**
+ * Default-on: a wp-config.php or mu-plugin that defines LG_BB_DEFAULT_ON as true makes the first request write a
+ * protected configuration (login limit, probe shield, automatic blocks; country filter stays off) and install the gate.
+ * Only when no configuration exists yet, so it never overrides a choice made on the admin page. Never define it on a
+ * site that sits behind a CDN or proxy unless LG_CRM_TRUSTED_PROXIES lists that proxy: every visitor would look like one address.
+ */
+add_action('init', function () {
+    if (!defined('LG_BB_DEFAULT_ON') || !LG_BB_DEFAULT_ON) {
+        return;
+    }
+    $f = lg_bb_rl_dir() . '/config.php';
+    if (is_file($f)) {
+        return;
+    }
+    lg_bb_rl_write($f, ['enabled' => 1, 'limit' => 8, 'window' => 10, 'block' => 30, 'block_xmlrpc' => 0, 'geo' => 'off', 'geo_countries' => ['CA', 'US'],
+        'probe' => 'on', 'probe_limit' => 5, 'probe_window' => 10, 'probe_block' => 60, 'auto' => 1, 'auto_days' => 30,
+        'rate' => 1, 'rate_limit' => 120, 'rate_limit_auth' => 600, 'rate_limit_bot' => 20, 'rate_auto_days' => 1, 'cron_guard' => 1, 'default_on' => gmdate('c')]);
+    lg_bb_gate_install();
+}, 1);
+
 function lg_bb_gate_needed($c)
 {
     $l = lg_bb_rl_lists();
-    return !empty($c['enabled']) || $c['geo'] === 'block' || $c['probe'] === 'on' || !empty($l['block_all']) || !empty($c['static']);
+    return !empty($c['enabled']) || $c['geo'] === 'block' || $c['probe'] === 'on' || !empty($l['block_all']) || !empty($c['auto']) || !empty($c['rate']) || !empty($c['cron_guard']);
 }
 
 function lg_bb_probe_file($ip)
@@ -1110,6 +1409,10 @@ function lg_bb_rl_record_failure($ip)
         $rec['until'] = $now + max(1, (int) $cfg['block']) * 60;
         $rec['f'] = [];
         $rec['denied'] = 0;
+        $rec['nb'] = (isset($rec['nb']) ? (int) $rec['nb'] : 0) + 1;
+        if ($rec['nb'] >= 3) {
+            lg_bb_auto_add($ip, 'login lockouts x' . $rec['nb']);
+        }
     }
     lg_bb_rl_write($file, $rec);
 }
@@ -1131,11 +1434,37 @@ function lg_bb_gate_install()
     if (file_exists($p) && !lg_bb_gate_installed()) {
         return false; // someone else's file: never overwrite
     }
+    $src = @file_get_contents(dirname(LG_BB_PROBE) . '/gate.php');
+    if (is_string($src) && $src !== '' && is_file($p) && @file_get_contents($p) === $src) {
+        return true; // already in place and current (for example copied by SFTP): nothing to write
+    }
     if (!is_dir(dirname($p))) {
         @mkdir(dirname($p), 0755, true);
     }
-    $src = @file_get_contents(dirname(LG_BB_PROBE) . '/gate.php');
     return is_string($src) && $src !== '' && @file_put_contents($p, $src) !== false;
+}
+
+/** Why the last lg_bb_gate_install() failed, in words the owner can act on (the old message just listed guesses). */
+function lg_bb_gate_why()
+{
+    $p = lg_bb_gate_path();
+    $dir = dirname($p);
+    if (file_exists($p) && !lg_bb_gate_installed()) {
+        return 'a file named ' . $p . ' already exists and was not written by this plugin, so it is never overwritten (rename or delete it by SFTP, then try again)';
+    }
+    $srcfile = dirname(LG_BB_PROBE) . '/gate.php';
+    $src = @file_get_contents($srcfile);
+    if (!is_string($src) || $src === '') {
+        return 'gate.php is missing or unreadable in the plugin folder (' . $srcfile . '); re-upload the whole plugin zip';
+    }
+    if (!is_dir($dir)) {
+        return 'the folder ' . $dir . ' does not exist and PHP cannot create it (' . WP_CONTENT_DIR . ' is not writable by the web user); create that folder by SFTP and copy gate.php from the plugin folder into it as lg-blackbox-gate.php, or ask the host';
+    }
+    if (!is_writable($dir)) {
+        return 'the folder ' . $dir . ' is not writable by PHP (permissions or ownership); ask the host to fix it, or copy gate.php from the plugin folder to ' . $p . ' by SFTP (the plugin then recognises it)';
+    }
+    $e = error_get_last();
+    return 'writing ' . $p . ' failed' . ($e && !empty($e['message']) ? ' (' . $e['message'] . ')' : '') . ', for example a full disk or a security rule on the host';
 }
 
 function lg_bb_gate_remove()
@@ -1305,7 +1634,7 @@ add_action('admin_post_lg_bb_login', function () {
 
     if ($op === 'enable') {
         if (!lg_bb_gate_install()) {
-            $msg = 'Could not install the gate (wp-content/mu-plugins not writable, or a file with that name already exists).';
+            $msg = 'Could not install the gate: ' . lg_bb_gate_why() . '.';
         } else {
             $cfg['enabled'] = 1;
             lg_bb_rl_write(lg_bb_rl_dir() . '/config.php', $cfg);
@@ -1339,12 +1668,16 @@ add_action('admin_post_lg_bb_login', function () {
         $myip = lg_bb_ip();
         $turning_on = ($op === 'geo_enable') || $cfg['geo'] === 'block';
         if ($turning_on && !lg_bb_cc_known($mycc)) {
-            $msg = 'Not changed: the server did not receive Cloudflare\'s country header (CF-IPCountry) on your request, so the filter could not work. '
-                . 'Ask the Cloudflare owner to make sure the site is proxied (orange cloud) and IP Geolocation is on (Network tab).';
+            $dg = lg_bb_ip_diag();
+            $msg = 'Not changed: the server did not receive a usable country header (CF-IPCountry) on your request, so the filter could not work. '
+                . (!empty($_SERVER['HTTP_CF_IPCOUNTRY'])
+                    ? 'The header is present but the connecting address ' . $dg['peer'] . ' is not a trusted proxy, so it is ignored: add the proxy ranges to LG_CRM_TRUSTED_PROXIES in wp-config.php. '
+                    : 'No such header arrived at all, so this site is probably not behind Cloudflare (or IP Geolocation is off in its Network tab). ')
+                . 'The country filter only works behind Cloudflare; the other protections do not need it.';
         } elseif ($turning_on && !in_array($mycc, $list, true)) {
             $msg = 'Not changed: your own visit comes from ' . lg_bb_cc_label($mycc) . ', which is not in that list. You would lock yourself out. Add ' . $mycc . ' or connect from an allowed country.';
         } elseif ($turning_on && !lg_bb_gate_install()) {
-            $msg = 'Could not install the gate (wp-content/mu-plugins not writable, or a file with that name already exists).';
+            $msg = 'Could not install the gate: ' . lg_bb_gate_why() . '.';
         } else {
             $cfg['geo_countries'] = $list;
             if ($op === 'geo_enable') {
@@ -1369,7 +1702,7 @@ add_action('admin_post_lg_bb_login', function () {
         $cfg['probe_window'] = max(1, min(120, (int) (isset($_POST['probe_window']) ? $_POST['probe_window'] : $cfg['probe_window'])));
         $cfg['probe_block'] = max(1, min(1440, (int) (isset($_POST['probe_block']) ? $_POST['probe_block'] : $cfg['probe_block'])));
         if ($op === 'probe_enable' && !lg_bb_gate_install()) {
-            $msg = 'Could not install the gate (wp-content/mu-plugins not writable, or a file with that name already exists).';
+            $msg = 'Could not install the gate: ' . lg_bb_gate_why() . '.';
         } else {
             if ($op === 'probe_enable') {
                 $cfg['probe'] = 'on';
@@ -1389,43 +1722,6 @@ add_action('admin_post_lg_bb_login', function () {
             lg_bb_gate_remove();
         }
         $msg = 'Probe shield disabled.';
-    } elseif ($op === 'static_enable' || $op === 'static_save') {
-        // Static-site mode: refuse every PHP entry point except page views for IPs that are not on the allow list.
-        $myip = lg_bb_ip();
-        if ($op === 'static_save') {
-            $cfg['static_forms'] = empty($_POST['static_forms']) ? 0 : 1;
-        }
-        if ($op === 'static_enable' && function_exists('lg_crm_log_file')) {
-            $msg = 'Not changed: the CRM plugin is active on this app. Static-site mode would refuse its REST API, webhooks (QuickBooks, Twilio) and logins. Use it only on a static site.';
-        } elseif ($op === 'static_enable' && (!$myip || !lg_bb_rl_public_ip($myip))) {
-            $msg = 'Not changed: your own public IP could not be read (private or missing address), so Black Box could not add you to the allow list and you could lock yourself out of wp-admin.';
-        } elseif ($op === 'static_enable' && !lg_bb_gate_install()) {
-            $msg = 'Could not install the gate (wp-content/mu-plugins not writable, or a file with that name already exists).';
-        } else {
-            if ($op === 'static_enable') {
-                $cfg['static'] = 1;
-                if (!in_array($myip, $lists['allow'], true)) {
-                    $lists['allow'][] = $myip; // the person enabling it keeps wp-admin access
-                    $save_lists();
-                }
-            }
-            lg_bb_rl_write(lg_bb_rl_dir() . '/config.php', $cfg);
-            $msg = $op === 'static_enable'
-                ? 'Static-site mode ON: only page views reach PHP. wp-admin, wp-login, xmlrpc, wp-cron and direct .php files are refused for every IP not on the allow list. Your current IP (' . $myip . ') was added to the allow list.'
-                : 'Static-site mode settings saved (' . (empty($cfg['static_forms']) ? 'forms, admin-ajax and the REST API are refused too' : 'admin-ajax, admin-post and the REST API stay open for contact forms') . ').';
-        }
-    } elseif ($op === 'static_disable') {
-        $cfg['static'] = 0;
-        lg_bb_rl_write(lg_bb_rl_dir() . '/config.php', $cfg);
-        if (!lg_bb_gate_needed($cfg)) {
-            lg_bb_gate_remove();
-        }
-        $msg = 'Static-site mode off.';
-    } elseif ($op === 'users_lock_on' || $op === 'users_lock_off') {
-        update_option('lg_bb_lock_users', $op === 'users_lock_on' ? '1' : '0', true);
-        $msg = $op === 'users_lock_on'
-            ? 'User names are private again: no public user list, author pages or "unknown user" login message.'
-            : 'User names are public again (REST user list, author pages and the specific login errors are back).';
     } elseif ($op === 'save') {
         $cfg['limit'] = max(3, min(100, (int) (isset($_POST['limit']) ? $_POST['limit'] : 8)));
         $cfg['window'] = max(1, min(120, (int) (isset($_POST['window']) ? $_POST['window'] : 10)));
@@ -1433,13 +1729,56 @@ add_action('admin_post_lg_bb_login', function () {
         $cfg['block_xmlrpc'] = empty($_POST['block_xmlrpc']) ? 0 : 1;
         lg_bb_rl_write(lg_bb_rl_dir() . '/config.php', $cfg);
         $msg = 'Settings saved.';
-    } elseif (in_array($op, ['block', 'blockall', 'allow', 'unblock', 'unallow', 'allowme'], true)) {
+    } elseif (in_array($op, ['rate_on', 'rate_off', 'cron_on', 'cron_off'], true)) {
+        $key = strpos($op, 'rate') === 0 ? 'rate' : 'cron_guard';
+        $cfg[$key] = substr($op, -3) === '_on' ? 1 : 0;
+        foreach (['rate_limit' => 120, 'rate_limit_auth' => 600, 'rate_limit_bot' => 20, 'rate_auto_days' => 1] as $k => $v) {
+            if (empty($cfg[$k])) {
+                $cfg[$k] = $v;
+            }
+        }
+        lg_bb_rl_write(lg_bb_rl_dir() . '/config.php', $cfg);
+        if ($cfg[$key] && !lg_bb_gate_install()) {
+            $msg = 'Saved, but the gate could not be installed: ' . lg_bb_gate_why() . '.';
+        } else {
+            $msg = ($key === 'rate' ? 'Request-rate limit' : 'wp-cron guard') . ($cfg[$key] ? ' is on.' : ' is off.');
+        }
+    } elseif ($op === 'ua_on' || $op === 'ua_off') {
+        $cfg['ua'] = $op === 'ua_on' ? 1 : 0;
+        $cfg['ua_load'] = isset($cfg['ua_load']) && $cfg['ua_load'] ? (float) $cfg['ua_load'] : 3.0;
+        lg_bb_rl_write(lg_bb_rl_dir() . '/config.php', $cfg);
+        if ($cfg['ua'] && empty($cfg['rate'])) {
+            $msg = 'Under-attack mode is on, but it works through the request-rate limit, which is off: turn that on too.';
+        } elseif ($cfg['ua'] && !lg_bb_gate_install()) {
+            $msg = 'Saved, but the gate could not be installed: ' . lg_bb_gate_why() . '.';
+        } else {
+            $msg = $cfg['ua'] ? 'Under-attack mode is on: while the load average is ' . $cfg['ua_load'] . ' or more, anonymous visitors get a quarter of the normal rate. Signed-in CRM users and webhooks are not affected.' : 'Under-attack mode is off.';
+        }
+    } elseif ($op === 'flood_on' || $op === 'flood_off') {
+        $sc = lg_bb_sec_read('config');
+        $sc['flood'] = $op === 'flood_on' ? 1 : 0;
+        lg_bb_sec_write('config', $sc);
+        $msg = $sc['flood'] ? '404 flood watch is on: an address causing many page misses or refused links is added to the automatic block list (needs automatic blocks on).' : '404 flood watch is off.';
+    } elseif ($op === 'auto_on' || $op === 'auto_off') {
+        $cfg['auto'] = $op === 'auto_on' ? 1 : 0;
+        $cfg['auto_days'] = max(1, (int) (isset($cfg['auto_days']) ? $cfg['auto_days'] : 30));
+        lg_bb_rl_write(lg_bb_rl_dir() . '/config.php', $cfg);
+        if ($cfg['auto'] && !lg_bb_gate_install()) {
+            $msg = 'Automatic blocks are on, but the gate could not be installed: ' . lg_bb_gate_why() . '.';
+        } else {
+            $msg = $cfg['auto'] ? 'Automatic blocks are on: repeat scanners and repeat login failures are refused for ' . $cfg['auto_days'] . ' days.' : 'Automatic blocks are off (entries already on the list stay until they expire or you unblock them).';
+        }
+    } elseif (in_array($op, ['block', 'blockall', 'allow', 'unblock', 'unallow', 'allowme', 'unauto'], true)) {
         if ($op === 'allowme') {
             $op = 'allow';
             $ip = lg_bb_ip();
         }
         if (!filter_var($ip, FILTER_VALIDATE_IP)) {
             $msg = 'Invalid IP address.';
+        } elseif ($op === 'unauto') {
+            @unlink(lg_bb_auto_file($ip));
+            @unlink(lg_bb_over_file($ip));
+            $msg = $ip . ' removed from the automatic block list.';
         } elseif ($op === 'blockall') {
             // Site-wide block: every request from this IP is refused by the gate before WordPress loads.
             if (!lg_bb_rl_public_ip($ip)) {
@@ -1460,7 +1799,7 @@ add_action('admin_post_lg_bb_login', function () {
                     lg_bb_rl_write(lg_bb_rl_dir() . '/config.php', $cfg); // the gate needs a config file to run at all
                 }
                 if (!lg_bb_gate_install()) {
-                    $msg = $ip . ' is on the list, but the gate could not be installed (wp-content/mu-plugins not writable, or a file with that name already exists), so it is NOT being refused yet.';
+                    $msg = $ip . ' is on the list, but the gate could not be installed: ' . lg_bb_gate_why() . ', so it is NOT being refused yet.';
                 } else {
                     $msg = $ip . ' blocked site-wide: every request from it is now refused with a 403 before WordPress loads. For a heavy attacker also block it in Cloudflare.';
                 }
@@ -1483,6 +1822,8 @@ add_action('admin_post_lg_bb_login', function () {
             @unlink(lg_bb_rl_ipfile($ip));
             @unlink(lg_bb_probe_file($ip));
             @unlink(lg_bb_blk_file($ip));
+            @unlink(lg_bb_auto_file($ip));
+            @unlink(lg_bb_over_file($ip));
             $msg = $ip . ' will never be blocked.';
         } else { // unblock / unallow
             $lists['block'] = $without($lists['block'], $ip);
@@ -1492,6 +1833,8 @@ add_action('admin_post_lg_bb_login', function () {
             @unlink(lg_bb_rl_ipfile($ip));
             @unlink(lg_bb_probe_file($ip));
             @unlink(lg_bb_blk_file($ip));
+            @unlink(lg_bb_auto_file($ip));
+            @unlink(lg_bb_over_file($ip));
             if (!lg_bb_gate_needed(lg_bb_rl_cfg())) {
                 lg_bb_gate_remove(); // nothing left that needs the gate
             }
@@ -1506,8 +1849,8 @@ function lg_bb_login_panel()
 {
     $cfg = lg_bb_rl_cfg();
     $installed = lg_bb_gate_installed();
-    if ($installed && strpos((string) @file_get_contents(lg_bb_gate_path()), 'LG-BLACKBOX-GATE v6') === false) {
-        lg_bb_gate_install(); // an older copy of our own gate (no probe shield): refresh it
+    if ($installed && strpos((string) @file_get_contents(lg_bb_gate_path()), 'LG-BLACKBOX-GATE v8') === false) {
+        lg_bb_gate_install(); // an older copy of our own gate: refresh it
     }
     $on = !empty($cfg['enabled']) && $installed;
     $rows = lg_bb_auth_table(24);
@@ -1519,20 +1862,28 @@ function lg_bb_login_panel()
     ?>
     <h2 id="lg-login">Login protection</h2>
     <?php if (!empty($_GET['lgmsg'])): ?>
-        <div class="notice notice-info inline"><p><?php echo esc_html(rawurldecode((string) $_GET['lgmsg'])); ?></p></div>
+        <div class="notice notice-info inline"><p><?php echo esc_html(wp_unslash(rawurldecode((string) $_GET['lgmsg']))); ?></p></div>
     <?php endif; ?>
     <p>
         Status: <strong><?php echo $on ? 'ON' : 'OFF'; ?></strong>
-        <?php if (!empty($cfg['enabled']) && !$installed): ?> — enabled in settings but the gate file is missing; press Enable again.<?php endif; ?>
+        <?php if (!empty($cfg['enabled']) && !$installed): ?> - enabled in settings but the gate file is missing; press Enable again.<?php endif; ?>
         <?php if ($on): ?>
-            — an IP with <?php echo (int) $cfg['limit']; ?> failed logins in <?php echo (int) $cfg['window']; ?> min is refused for
+            - an IP with <?php echo (int) $cfg['limit']; ?> failed logins in <?php echo (int) $cfg['window']; ?> min is refused for
             <?php echo (int) $cfg['block']; ?> min (wp-login.php, xmlrpc.php and the CRM login only; the rest of the site keeps
             working for them).
         <?php endif; ?>
         Your IP as seen by the server: <code><?php echo esc_html($me ?: 'unknown'); ?></code>
+        <?php $dg = lg_bb_ip_diag(); ?>
+        (TCP peer <code><?php echo esc_html($dg['peer'] ?: 'unknown'); ?></code>, <?php echo $dg['trusted'] ? 'a trusted proxy: forwarded IP and country headers are believed' : 'not a trusted proxy: forwarded headers are ignored'; ?>)
         <?php if ($me && !lg_bb_rl_public_ip($me)): ?>
-            <strong>— this is a private address, which means the server cannot see real visitor IPs; protection would be
+            <strong>This is a private address, which means the server cannot see real visitor IPs; protection would be
                 ineffective, so it ignores private addresses.</strong>
+        <?php endif; ?>
+        <?php if ($dg['ignored']): ?>
+            <br><strong>This request carried CF-Connecting-IP / X-Forwarded-For but the TCP peer is not trusted, so they were
+                ignored and every visitor looks like the peer. If the site is behind Cloudflare and PHP sees Cloudflare's address as
+                the peer, add Cloudflare's published ranges to <code>LG_CRM_TRUSTED_PROXIES</code> in wp-config.php (the CRM's own
+                login limits use the same rule) before enabling protection.</strong>
         <?php endif; ?>
     </p>
     <p>
@@ -1563,8 +1914,8 @@ function lg_bb_login_panel()
     ?>
     <p>
         Status: <strong><?php echo $probe_on ? 'ON' : 'OFF'; ?></strong>
-        <?php if (lg_bb_probe_on() && !$installed): ?> — enabled in settings but the gate file is missing; press Enable again.<?php endif; ?>
-        — a request for a file that does not exist and that only a vulnerability scanner asks for (<code>/.env</code>,
+        <?php if (lg_bb_probe_on() && !$installed): ?> - enabled in settings but the gate file is missing; press Enable again.<?php endif; ?>
+        - a request for a file that does not exist and that only a vulnerability scanner asks for (<code>/.env</code>,
         <code>/actuator/…</code>, <code>credentials.json</code>, <code>terraform.tfstate</code>, <code>wp-config.txt</code>…) is answered with a
         3-byte 404 <em>before WordPress loads</em> instead of a 0.6 CPU-second page build. An IP that sends
         <?php echo (int) $cfg['probe_limit']; ?> such requests within <?php echo (int) $cfg['probe_window']; ?> min is refused everywhere for
@@ -1608,7 +1959,7 @@ function lg_bb_login_panel()
                         <td><?php echo esc_html($r['status']); ?></td>
                         <td><code><?php echo esc_html($r['paths']); ?></code></td>
                         <td>
-                            <?php $bl = lg_bb_block_link($r['ip']); echo $bl !== '' ? $bl . ' · ' : ''; ?>
+                            <?php $bl = lg_bb_block_link($r['ip']); echo $bl !== '' ? $bl . ' · ' : ''; $al = lg_bb_abuse_link($r['ip']); echo $al !== '' ? $al . ' · ' : ''; ?>
                             <a href="<?php echo $link('allow', $r['ip']); ?>">Never block</a> ·
                             <a href="<?php echo $link('unblock', $r['ip']); ?>">Reset</a>
                         </td>
@@ -1626,13 +1977,13 @@ function lg_bb_login_panel()
     ?>
     <p>
         Status: <strong><?php echo $geo_on ? 'ON' : 'OFF'; ?></strong>
-        <?php if (lg_bb_geo_on() && !$installed): ?> — enabled in settings but the gate file is missing; press Enable again.<?php endif; ?>
+        <?php if (lg_bb_geo_on() && !$installed): ?> - enabled in settings but the gate file is missing; press Enable again.<?php endif; ?>
         <?php if ($geo_on): ?>
-            — wp-login.php, xmlrpc.php and the CRM login are refused (403) for visitors outside
+            - wp-login.php, xmlrpc.php and the CRM login are refused (403) for visitors outside
             <strong><?php echo esc_html(implode(', ', $cfg['geo_countries'])); ?></strong>. Password-protected-page
             forms, the rest of the site, and allow-listed IPs are not affected. Unknown or missing country is let through.
         <?php else: ?>
-            — off: nothing is refused by country. The table below still shows where login attempts come from.
+            - off: nothing is refused by country. The table below still shows where login attempts come from.
         <?php endif; ?>
         <br>Your country as seen by the server:
         <?php if (lg_bb_cc_known($mycc)): ?>
@@ -1680,8 +2031,7 @@ function lg_bb_login_panel()
             </tbody>
         </table>
     <?php endif; ?>
-    <h3 id="lg-login-sources">Login sources, last 24 h</h3>
-    <p>Failures are wrong passwords; a normal user shows a few attempts, a bot shows hundreds.</p>
+    <p>Login sources, last 24 h (failures are wrong passwords; a normal user shows a few attempts, a bot shows hundreds).</p>
     <?php if (!$rows): ?>
         <p>No login attempts recorded yet.</p>
     <?php else: ?>
@@ -1711,7 +2061,7 @@ function lg_bb_login_panel()
                         <td>
                             <?php if ($r['status'] === '' || strpos($r['status'], 'BLOCKED') === false): ?>
                                 <a href="<?php echo $link('block', $r['ip']); ?>" title="Refuse logins from this IP only">Block logins</a> ·
-                                <?php $bl = lg_bb_block_link($r['ip']); echo $bl !== '' ? $bl . ' · ' : ''; ?>
+                                <?php $bl = lg_bb_block_link($r['ip']); echo $bl !== '' ? $bl . ' · ' : ''; $al = lg_bb_abuse_link($r['ip']); echo $al !== '' ? $al . ' · ' : ''; ?>
                             <?php endif; ?>
                             <?php if ($r['status'] !== 'ALLOWED'): ?>
                                 <a href="<?php echo $link('allow', $r['ip']); ?>">Never block</a>
@@ -1753,18 +2103,22 @@ function lg_bb_rec_sources($hours = 24, $limit = 25)
                 continue;
             }
             $r = json_decode($line, true);
-            if (!is_array($r) || !isset($r['t'], $r['ip']) || $r['t'] < $since || !lg_bb_rl_public_ip((string) $r['ip'])) {
-                continue;
+            if (!is_array($r) || !isset($r['t'], $r['ip']) || $r['t'] < $since || !lg_bb_rl_public_ip((string) $r['ip']) || lg_bb_sec_is_self((string) $r['ip'])) {
+                continue; // (the server's own self-checks and cron are not "sources")
             }
             $ip = (string) $r['ip'];
             if (!isset($by[$ip])) {
                 if (count($by) >= 3000) {
                     continue; // bound memory on a very large window
                 }
-                $by[$ip] = ['ip' => $ip, 'cc' => '', 'ua' => '', 'n' => 0, 'paths' => [], 'probe' => [], 'last' => 0];
+                $by[$ip] = ['ip' => $ip, 'cc' => '', 'ua' => '', 'n' => 0, 'paths' => [], 'probe' => [], 'last' => 0, 'au' => 0, 'tn' => []];
             }
             $b = &$by[$ip];
             $b['n']++;
+            $b['au'] += !empty($r['a']) ? 1 : 0;   // requests carrying a CRM Bearer token (a logged-in app, not a bot)
+            if (!empty($r['tn']) && count($b['tn']) < 5) {
+                $b['tn'][(string) $r['tn']] = true;
+            }
             $b['last'] = max($b['last'], (int) $r['t']);
             if (!empty($r['cc'])) {
                 $b['cc'] = (string) $r['cc'];
@@ -1788,7 +2142,7 @@ function lg_bb_rec_sources($hours = 24, $limit = 25)
         $scanner = $np >= 3 && !preg_match($trusted, $b['ua']);
         $rows[] = [
             'ip' => $b['ip'], 'cc' => $b['cc'], 'ua' => $b['ua'], 'n' => $b['n'], 'last' => $b['last'],
-            'paths' => count($b['paths']), 'probes' => $np, 'scanner' => $scanner,
+            'paths' => count($b['paths']), 'probes' => $np, 'scanner' => $scanner, 'auth' => $b['au'], 'tenants' => array_keys($b['tn']),
             'sample' => implode(' ', array_slice(array_keys($np ? $b['probe'] : $b['paths']), 0, 4)),
         ];
     }
@@ -1801,13 +2155,293 @@ function lg_bb_rec_sources($hours = 24, $limit = 25)
     return $cache[$key] = array_slice($rows, 0, $limit);
 }
 
+// ---------------------------------------------------------------- abuse reports (manual, one click after a preview)
+
+define('LG_BB_ABUSE_REPEAT_DAYS', 7);   // the same IP is not reported twice within this many days
+define('LG_BB_ABUSE_PER_DAY', 20);      // hard cap on reports sent per 24 h from this install
+
+/** Reports already sent: ip => ['t' => unix time, 'to' => address]. */
+function lg_bb_abuse_log()
+{
+    $l = get_option('lg_bb_abuse_log', []);
+    return is_array($l) ? $l : [];
+}
+
+/** The address the report is sent FROM. Must be on a domain verified in the host's mail add-on (Elastic Email on this server). */
+function lg_bb_abuse_from()
+{
+    if (defined('LG_BB_ABUSE_FROM') && is_email((string) LG_BB_ABUSE_FROM)) {
+        return (string) LG_BB_ABUSE_FROM;
+    }
+    $host = wp_parse_url(home_url(), PHP_URL_HOST);
+    return 'security@' . (is_string($host) && $host !== '' ? $host : 'localhost');
+}
+
+/** "Report abuse" link for an IP in any table, a "reported" note, or '' when reporting makes no sense (private, allow-listed, you). */
+function lg_bb_abuse_link($ip)
+{
+    static $lists = null, $me = null;
+    if ($lists === null) {
+        $lists = lg_bb_rl_lists();
+        $me = lg_bb_ip();
+    }
+    if (!is_string($ip) || !lg_bb_rl_public_ip($ip) || $ip === $me || in_array($ip, $lists['allow'], true)) {
+        return '';
+    }
+    $log = lg_bb_abuse_log();
+    if (isset($log[$ip]) && (int) $log[$ip]['t'] > time() - LG_BB_ABUSE_REPEAT_DAYS * 86400) {
+        return '<span style="color:#555" title="' . esc_attr('Sent to ' . $log[$ip]['to']) . '">reported ' . esc_html(lg_bb_date('M j', (int) $log[$ip]['t'])) . '</span>';
+    }
+    return '<a href="' . esc_url(wp_nonce_url(admin_url('admin-post.php?action=lg_bb_abuse&op=preview&ip=' . rawurlencode($ip)), 'lg_bb_abuse')) . '">Report abuse</a>';
+}
+
+/** First e-mail address of an RDAP entity's vCard, or ''. */
+function lg_bb_abuse_vcard_email($ent)
+{
+    if (empty($ent['vcardArray'][1]) || !is_array($ent['vcardArray'][1])) {
+        return '';
+    }
+    foreach ($ent['vcardArray'][1] as $item) {
+        if (is_array($item) && isset($item[0], $item[3]) && $item[0] === 'email' && is_string($item[3]) && is_email($item[3])) {
+            return $item[3];
+        }
+    }
+    return '';
+}
+
+/** Depth-first search of RDAP entities for the abuse contact's address. */
+function lg_bb_abuse_find($entities, $depth = 0)
+{
+    if (!is_array($entities) || $depth > 4) {
+        return '';
+    }
+    foreach ($entities as $e) {
+        if (!is_array($e)) {
+            continue;
+        }
+        if (!empty($e['roles']) && in_array('abuse', (array) $e['roles'], true)) {
+            $m = lg_bb_abuse_vcard_email($e);
+            if ($m !== '') {
+                return $m;
+            }
+        }
+        if (!empty($e['entities'])) {
+            $m = lg_bb_abuse_find($e['entities'], $depth + 1);
+            if ($m !== '') {
+                return $m;
+            }
+        }
+    }
+    return '';
+}
+
+/**
+ * Who runs this IP, from the public RDAP registry (rdap.org redirects to the right regional registry).
+ * Cached 7 days. Returns ['abuse' => address or '', 'name', 'range', 'country', 'error'].
+ */
+function lg_bb_abuse_rdap($ip)
+{
+    $key = 'lg_bb_rdap_' . substr(sha1($ip), 0, 20);
+    $hit = get_transient($key);
+    if (is_array($hit)) {
+        return $hit;
+    }
+    $out = ['abuse' => '', 'name' => '', 'range' => '', 'country' => '', 'error' => ''];
+    $res = wp_remote_get('https://rdap.org/ip/' . rawurlencode($ip), ['timeout' => 10, 'redirection' => 4, 'headers' => ['Accept' => 'application/rdap+json, application/json']]);
+    if (is_wp_error($res)) {
+        $out['error'] = 'Registry lookup failed: ' . $res->get_error_message();
+        return $out; // not cached: try again next time
+    }
+    $j = json_decode((string) wp_remote_retrieve_body($res), true);
+    if (wp_remote_retrieve_response_code($res) !== 200 || !is_array($j)) {
+        $out['error'] = 'Registry lookup returned HTTP ' . (int) wp_remote_retrieve_response_code($res) . '.';
+        return $out;
+    }
+    $out['name'] = isset($j['name']) ? substr(preg_replace('/[^\w.\- ]/', '', (string) $j['name']), 0, 80) : '';
+    $out['country'] = isset($j['country']) ? substr(preg_replace('/[^A-Za-z]/', '', (string) $j['country']), 0, 2) : '';
+    if (!empty($j['startAddress']) && !empty($j['endAddress'])) {
+        $out['range'] = substr((string) $j['startAddress'] . ' - ' . (string) $j['endAddress'], 0, 90);
+    }
+    $out['abuse'] = lg_bb_abuse_find(isset($j['entities']) ? $j['entities'] : []);
+    set_transient($key, $out, 7 * DAY_IN_SECONDS);
+    return $out;
+}
+
+/** What this install recorded for the IP in the last $hours: total, first/last time and up to 30 sample lines (UTC, method, path; no query strings). */
+function lg_bb_abuse_evidence($ip, $hours = 48)
+{
+    $since = time() - $hours * 3600;
+    $n = 0;
+    $first = 0;
+    $last = 0;
+    $probe = [];
+    $other = [];
+    $methods = ['G' => 'GET', 'P' => 'POST', 'H' => 'HEAD', 'O' => 'OPTIONS'];
+    foreach ([lg_bb_rec_file(true), lg_bb_rec_file()] as $file) {
+        $h = @fopen($file, 'r');
+        if (!$h) {
+            continue;
+        }
+        while (($line = fgets($h)) !== false) {
+            if ($line[0] !== '{') {
+                continue;
+            }
+            $r = json_decode($line, true);
+            if (!is_array($r) || !isset($r['t'], $r['ip']) || $r['ip'] !== $ip || $r['t'] < $since) {
+                continue;
+            }
+            $n++;
+            $first = $first ? min($first, (int) $r['t']) : (int) $r['t'];
+            $last = max($last, (int) $r['t']);
+            $p = isset($r['p']) ? (string) $r['p'] : '';
+            $mk = isset($r['m']) ? (string) $r['m'] : '?';
+            $row = gmdate('Y-m-d H:i:s', (int) $r['t']) . 'Z ' . (isset($methods[$mk]) ? $methods[$mk] : $mk) . ' ' . $p;
+            if (lg_bb_looks_like_probe($p)) {
+                if (count($probe) < 30) {
+                    $probe[] = $row;
+                }
+            } elseif (count($other) < 10) {
+                $other[] = $row;
+            }
+        }
+        fclose($h);
+    }
+    // Scanner-only paths first (that is the complaint), then a few others for context.
+    $lines = array_slice(array_merge($probe, $other), 0, 30);
+    // The probe shield and the gate keep their own per-IP counters for requests they refused before WordPress loaded.
+    $extra = 0;
+    foreach ([lg_bb_rl_dir() . '/probe-' . substr(sha1($ip), 0, 20) . '.php', lg_bb_blk_file($ip)] as $f) {
+        $rec = lg_bb_rl_read($f);
+        if (is_array($rec)) {
+            $extra += (int) (isset($rec['n']) ? $rec['n'] : 0) + (int) (isset($rec['denied']) ? $rec['denied'] : 0);
+            if (!empty($rec['first'])) {
+                $first = $first ? min($first, (int) $rec['first']) : (int) $rec['first'];
+            }
+            if (!empty($rec['last'])) {
+                $last = max($last, (int) $rec['last']);
+            }
+        }
+    }
+    return ['n' => $n, 'extra' => $extra, 'first' => $first, 'last' => $last, 'lines' => $lines];
+}
+
+/** Subject and body of the report. Built on the server at send time; nothing the browser posts goes into it. */
+function lg_bb_abuse_message($ip, $net, $ev)
+{
+    $host = (string) wp_parse_url(home_url(), PHP_URL_HOST);
+    $subject = 'Abuse report: scanning from ' . $ip . ' (' . gmdate('Y-m-d') . ' UTC)';
+    $b = [];
+    $b[] = 'Hello,';
+    $b[] = '';
+    $b[] = 'The address ' . $ip . ($net['name'] !== '' ? ' (network ' . $net['name'] . ($net['range'] !== '' ? ', ' . $net['range'] : '') . ')' : '')
+        . ' is sending automated requests to our web server (' . $host . ') that probe for hidden files, credentials and admin interfaces'
+        . ' (for example .env, /actuator, credentials files). It is not a normal visitor or a search engine.';
+    $b[] = '';
+    $b[] = 'Our logs show ' . ((int) $ev['n'] + (int) $ev['extra']) . ' requests'
+        . ($ev['first'] ? ' between ' . gmdate('Y-m-d H:i:s', (int) $ev['first']) . 'Z and ' . gmdate('Y-m-d H:i:s', (int) $ev['last']) . 'Z' : '') . '. Times are UTC. Sample:';
+    $b[] = '';
+    foreach ($ev['lines'] as $l) {
+        $b[] = '  ' . $l;
+    }
+    if (!$ev['lines']) {
+        $b[] = '  (the sample lines have rotated out of our recorder; the counts above come from our block records)';
+    }
+    $b[] = '';
+    $b[] = 'Please investigate the host using this address and stop the activity. Reply to this message if you need more detail. No personal data of our visitors is included in this report.';
+    $b[] = '';
+    $b[] = 'Sent by the site administrator of ' . $host . '.';
+    return [$subject, implode("\n", $b)];
+}
+
+add_action('admin_post_lg_bb_abuse', function () {
+    lg_bb_admin_guard('lg_bb_abuse');
+    $op = isset($_REQUEST['op']) ? (string) $_REQUEST['op'] : '';
+    $ip = isset($_REQUEST['ip']) ? trim((string) wp_unslash($_REQUEST['ip'])) : '';
+    $back = admin_url('tools.php?page=lg-blackbox');
+    $done = function ($msg) use ($back) {
+        wp_safe_redirect(add_query_arg('lgmsg', rawurlencode($msg), $back) . '#lg-sources');
+        exit;
+    };
+    if (!lg_bb_rl_public_ip($ip)) {
+        $done('Not reported: ' . $ip . ' is not a public address.');
+    }
+    $lists = lg_bb_rl_lists();
+    if ($ip === lg_bb_ip() || in_array($ip, $lists['allow'], true)) {
+        $done('Not reported: that address is yours or on the "never block" list.');
+    }
+    $log = lg_bb_abuse_log();
+    if (isset($log[$ip]) && (int) $log[$ip]['t'] > time() - LG_BB_ABUSE_REPEAT_DAYS * 86400) {
+        $done($ip . ' was already reported on ' . lg_bb_date('M j', (int) $log[$ip]['t']) . ' to ' . $log[$ip]['to'] . '.');
+    }
+    $net = lg_bb_abuse_rdap($ip);
+    $ev = lg_bb_abuse_evidence($ip);
+    list($subject, $body) = lg_bb_abuse_message($ip, $net, $ev);
+    $me = wp_get_current_user();
+
+    if ($op === 'send') {
+        $to = isset($_POST['to']) ? trim((string) wp_unslash($_POST['to'])) : '';
+        if (!is_email($to)) {
+            $done('Not sent: "' . $to . '" is not a valid e-mail address.');
+        }
+        $today = 0;
+        foreach ($log as $v) {
+            $today += ((int) $v['t'] > time() - 86400) ? 1 : 0;
+        }
+        if ($today >= LG_BB_ABUSE_PER_DAY) {
+            $done('Not sent: ' . LG_BB_ABUSE_PER_DAY . ' abuse reports already went out in the last 24 hours.');
+        }
+        $headers = ['Content-Type: text/plain; charset=UTF-8', 'From: LG Black Box <' . lg_bb_abuse_from() . '>'];
+        if (is_email($me->user_email)) {
+            $headers[] = 'Reply-To: ' . $me->user_email;
+            $headers[] = 'Cc: ' . $me->user_email;
+        }
+        $ok = wp_mail($to, $subject, $body, $headers);
+        if (!$ok) {
+            $done('The report could not be sent (the mail service refused it). Check that ' . lg_bb_abuse_from() . ' is on a domain verified in the mail add-on, or set LG_BB_ABUSE_FROM in wp-config.php.');
+        }
+        $log[$ip] = ['t' => time(), 'to' => $to];
+        if (count($log) > 200) {
+            $log = array_slice($log, -200, null, true);
+        }
+        update_option('lg_bb_abuse_log', $log, false);
+        $done('Abuse report for ' . $ip . ' sent to ' . $to . ' (a copy went to ' . (is_email($me->user_email) ? $me->user_email : 'nobody: your profile has no e-mail') . ').');
+    }
+
+    // Preview page: nothing is sent until the button below is pressed.
+    nocache_headers();
+    header('Content-Type: text/html; charset=utf-8');
+    $nonce = wp_create_nonce('lg_bb_abuse');
+    echo '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Report abuse</title>'
+        . '<style>body{font:14px/1.5 -apple-system,Segoe UI,sans-serif;max-width:780px;margin:2em auto;padding:0 1em;color:#1d2327}pre{background:#f6f7f7;border:1px solid #dcdcde;padding:1em;white-space:pre-wrap}'
+        . 'input[type=email]{width:100%;max-width:420px;padding:6px}button{display:inline-block;padding:8px 16px;border:1px solid #2271b1;background:#2271b1;color:#fff;border-radius:3px;cursor:pointer}a.c{margin-left:1em}.w{background:#fcf9e8;border-left:4px solid #dba617;padding:8px 12px}</style></head><body>';
+    echo '<h1>Report abuse: ' . esc_html($ip) . '</h1>';
+    echo '<p><strong>Network:</strong> ' . esc_html($net['name'] !== '' ? $net['name'] : 'unknown') . ($net['range'] !== '' ? ' (' . esc_html($net['range']) . ')' : '') . ($net['country'] !== '' ? ', ' . esc_html($net['country']) : '')
+        . '<br><small>Looked up in the public RDAP registry (the address was sent to rdap.org for this lookup).</small></p>';
+    if ($net['error'] !== '') {
+        echo '<p class="w">' . esc_html($net['error']) . '</p>';
+    }
+    if ($net['abuse'] === '') {
+        echo '<p class="w">The registry lists no abuse contact for this address. Look one up yourself (for example on the registry page for this range) and type it below, or do not report.</p>';
+    }
+    echo '<p>This is exactly what will be sent. Nothing is sent until you press the button.</p>';
+    echo '<p><strong>Subject:</strong> ' . esc_html($subject) . '</p><pre>' . esc_html($body) . '</pre>';
+    echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '">'
+        . '<input type="hidden" name="action" value="lg_bb_abuse"><input type="hidden" name="op" value="send"><input type="hidden" name="ip" value="' . esc_attr($ip) . '">'
+        . '<input type="hidden" name="_wpnonce" value="' . esc_attr($nonce) . '">'
+        . '<p><label><strong>Send to</strong><br><input type="email" name="to" required value="' . esc_attr($net['abuse']) . '"></label></p>'
+        . '<p>From <code>' . esc_html(lg_bb_abuse_from()) . '</code>' . (is_email($me->user_email) ? ', reply-to and copy to <code>' . esc_html($me->user_email) . '</code>' : '') . '.</p>'
+        . '<button type="submit">Send the report</button><a class="c" href="' . esc_url($back) . '">Cancel</a></form>';
+    echo '</body></html>';
+    exit;
+});
+
 /** Admin panel: who is sending the most requests (scanner-like IPs flagged) with a Block button, and the site-wide block list. */
 function lg_bb_blocked_panel()
 {
     $lists = lg_bb_rl_lists();
     $sources = lg_bb_rec_sources(24, 25);
     ?>
-    <h2 id="lg-sources">Request sources, last 24 h</h2>
+    <h3 id="lg-sources">Request sources, last 24 h (from the burst recorder)</h3>
     <p>The IPs sending the most requests that reached WordPress. <strong>Scanner-like</strong> = at least 3 requests for paths only a
         vulnerability scanner asks for (<code>.env</code>, <code>/actuator</code>, <code>credentials.json</code>…) from a client that is not a
         search or link-preview crawler. Nothing is blocked automatically from this table: use the button.</p>
@@ -1838,15 +2472,74 @@ function lg_bb_blocked_panel()
                         <td><?php echo (int) $s['probes']; ?></td>
                         <td><?php echo $s['last'] ? lg_bb_t($s['last']) : ''; ?></td>
                         <td style="font-size:11px"><?php echo esc_html($s['ua']); ?></td>
-                        <td><code style="font-size:11px"><?php echo esc_html($s['sample']); ?></code></td>
-                        <td><?php $bl = lg_bb_block_link($s['ip']); echo $bl !== '' ? $bl : (in_array($s['ip'], $lists['allow'], true) ? 'never block' : 'you'); ?></td>
+                        <td><code style="font-size:11px"><?php echo esc_html($s['sample']); ?></code><?php
+                            if (!empty($s['auth'])) {
+                                echo '<br><strong style="color:#996800">' . (int) $s['auth'] . ' logged-in CRM API calls from this IP (an office or a phone?). Check before blocking: it may be a customer.</strong>';
+                            }
+                            if (!empty($s['tenants'])) {
+                                echo '<br>tenant: ' . esc_html(implode(', ', array_map('lg_bb_tenant_label', $s['tenants'])));
+                            }
+                        ?></td>
+                        <td><?php $bl = lg_bb_block_link($s['ip']); echo $bl !== '' ? $bl : (in_array($s['ip'], $lists['allow'], true) ? 'never block' : 'you'); if ($s['scanner'] && empty($s['auth'])) { $al = lg_bb_abuse_link($s['ip']); echo $al !== '' ? '<br>' . $al : ''; } ?></td>
                     </tr>
                 <?php endforeach; ?>
             </tbody>
         </table>
     <?php endif; ?>
 
-    <h2 id="lg-blocked">Blocked IPs (site-wide)</h2>
+    <?php $acfg = lg_bb_rl_cfg(); $autos = lg_bb_auto_list(); ?>
+    <h3 id="lg-auto">Automatic blocks (repeat offenders)</h3>
+    <p>Status: <strong><?php echo !empty($acfg['auto']) ? 'ON' : 'OFF'; ?></strong>.
+        When on, an IP that keeps scanning (blocked twice by the probe shield) or keeps failing logins (locked out 3 times) is refused on every request for
+        <?php echo (int) $acfg['auto_days']; ?> days, before WordPress loads. It never applies to an IP on the "never block" list or to an IP that has made logged-in CRM
+        calls, and every entry expires by itself; Unblock removes it at once.
+        <a href="<?php echo esc_url(lg_bb_ip_action_url(!empty($acfg['auto']) ? 'auto_off' : 'auto_on', '0.0.0.0')); ?>"><?php echo !empty($acfg['auto']) ? 'Turn off' : 'Turn on'; ?></a></p>
+    <?php if ($autos): ?>
+        <table class="widefat striped" style="max-width:900px;margin-bottom:1em">
+            <thead><tr><th>IP</th><th>Why</th><th>Since</th><th>Requests refused</th><th>Expires</th><th></th></tr></thead>
+            <tbody>
+                <?php foreach ($autos as $ar): ?>
+                    <tr>
+                        <td><?php echo esc_html($ar['ip']); ?></td>
+                        <td><?php echo esc_html(isset($ar['why']) ? $ar['why'] : ''); ?></td>
+                        <td><?php echo lg_bb_t((int) $ar['first']); ?></td>
+                        <td><?php echo (int) (isset($ar['n']) ? $ar['n'] : 0); ?></td>
+                        <td><?php echo esc_html(lg_bb_date('M j', (int) $ar['until'])); ?></td>
+                        <td><a href="<?php echo esc_url(lg_bb_ip_action_url('unauto', $ar['ip'])); ?>">Unblock</a><?php $al = lg_bb_abuse_link($ar['ip']); echo $al !== '' ? ' · ' . $al : ''; ?></td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    <?php endif; ?>
+
+    <?php $overs = lg_bb_over_list(); ?>
+    <h3 id="lg-rate">Request-rate limit and wp-cron guard</h3>
+    <p>Request-rate limit: <strong><?php echo !empty($acfg['rate']) ? 'ON' : 'OFF'; ?></strong>
+        (<a href="<?php echo esc_url(lg_bb_ip_action_url(!empty($acfg['rate']) ? 'rate_off' : 'rate_on', '0.0.0.0')); ?>"><?php echo !empty($acfg['rate']) ? 'turn off' : 'turn on'; ?></a>).
+        An IP (IPv6: a whole /64) that sends more than <?php echo (int) $acfg['rate_limit']; ?> PHP requests a minute, or <?php echo (int) $acfg['rate_limit_auth']; ?> when it presents a
+        login (CRM token or WordPress cookie), or <?php echo (int) $acfg['rate_limit_bot']; ?> when it is an aggressive crawler, gets a 429 before WordPress loads. Five over-limit
+        minutes within an hour put it on the automatic list for <?php echo (int) $acfg['rate_auto_days']; ?> day(s). Never for an allow-listed IP; search crawlers only get the 429.<br>
+        wp-cron guard: <strong><?php echo !empty($acfg['cron_guard']) ? 'ON' : 'OFF'; ?></strong>
+        (<a href="<?php echo esc_url(lg_bb_ip_action_url(!empty($acfg['cron_guard']) ? 'cron_off' : 'cron_on', '0.0.0.0')); ?>"><?php echo !empty($acfg['cron_guard']) ? 'turn off' : 'turn on'; ?></a>).
+        wp-cron.php answers only the server itself, so nobody else can make WordPress load by calling it.</p>
+    <?php if ($overs): ?>
+        <table class="widefat striped" style="max-width:900px;margin-bottom:1em">
+            <thead><tr><th>IP</th><th>Minutes over the limit (last hour)</th><th>Last</th><th>Path</th><th></th></tr></thead>
+            <tbody>
+                <?php foreach (array_slice($overs, 0, 15) as $ov): ?>
+                    <tr>
+                        <td><?php echo esc_html($ov['ip']); ?></td>
+                        <td><?php echo (int) $ov['n']; ?></td>
+                        <td><?php echo lg_bb_t((int) $ov['last']); ?></td>
+                        <td><code style="font-size:11px"><?php echo esc_html(isset($ov['p']) ? $ov['p'] : ''); ?></code></td>
+                        <td><?php $bl = lg_bb_block_link($ov['ip']); echo $bl; $al = lg_bb_abuse_link($ov['ip']); echo $al !== '' ? ' · ' . $al : ''; ?></td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    <?php endif; ?>
+
+    <h3 id="lg-blocked">Blocked IPs (site-wide)</h3>
     <p>Every request from these IPs is refused with a 403 by the gate, before WordPress loads (cheap, but PHP still starts, so for a heavy
         attacker also block the IP in Cloudflare: paste the list below into a WAF custom rule or an IP list). Never applies to an IP on the
         "never block" list, so you cannot lock yourself out.</p>
@@ -1869,9 +2562,9 @@ function lg_bb_blocked_panel()
                     <tr>
                         <td><?php echo esc_html($ip); ?></td>
                         <td><?php echo is_array($rec) ? (int) $rec['n'] : 0; ?></td>
-                        <td><?php echo is_array($rec) && !empty($rec['last']) ? lg_bb_t((int) $rec['last']) : '—'; ?></td>
+                        <td><?php echo is_array($rec) && !empty($rec['last']) ? lg_bb_t((int) $rec['last']) : '-'; ?></td>
                         <td><code style="font-size:11px"><?php echo is_array($rec) && isset($rec['p']) ? esc_html($rec['p']) : ''; ?></code></td>
-                        <td><a href="<?php echo esc_url(lg_bb_ip_action_url('unblock', $ip)); ?>">Unblock</a></td>
+                        <td><a href="<?php echo esc_url(lg_bb_ip_action_url('unblock', $ip)); ?>">Unblock</a><?php $al = lg_bb_abuse_link($ip); echo $al !== '' ? ' · ' . $al : ''; ?></td>
                     </tr>
                 <?php endforeach; ?>
             </tbody>
@@ -2030,6 +2723,22 @@ function lg_bb_report($hours = 6)
         $brec = lg_bb_rl_read(lg_bb_blk_file($bip));
         $L[] = $bip . ' | refused ' . (is_array($brec) ? (int) $brec['n'] : 0) . ' requests' . (is_array($brec) && !empty($brec['last']) ? ', last ' . $f((int) $brec['last']) : '');
     }
+    $auto_rows = lg_bb_auto_list();
+    $L[] = '';
+    $L[] = '== AUTO-BLOCKED REPEAT OFFENDERS (' . count($auto_rows) . ', automatic blocks ' . (!empty(lg_bb_rl_cfg()['auto']) ? 'ON' : 'OFF') . ') ==';
+    foreach (array_slice($auto_rows, 0, 15) as $ar) {
+        $L[] = $ar['ip'] . ' | ' . (isset($ar['why']) ? $ar['why'] : '') . ' | since ' . $f((int) $ar['first']) . ' | refused ' . (int) (isset($ar['n']) ? $ar['n'] : 0) . ' requests | expires ' . gmdate('Y-m-d', (int) $ar['until']);
+    }
+    $ovr = lg_bb_over_list();
+    $L[] = '';
+    $L[] = '== REQUEST-RATE LIMIT (' . (!empty(lg_bb_rl_cfg()['rate']) ? 'ON' : 'OFF') . ', wp-cron guard ' . (!empty(lg_bb_rl_cfg()['cron_guard']) ? 'ON' : 'OFF') . '): ' . count($ovr) . ' IPs refused in the last day ==';
+    foreach (array_slice($ovr, 0, 10) as $ov) {
+        $L[] = $ov['ip'] . ' | ' . (int) $ov['n'] . ' minutes over ' . (isset($ov['limit']) ? (int) $ov['limit'] : 0) . '/min | last ' . $f((int) $ov['last']) . ' | ' . (isset($ov['p']) ? $ov['p'] : '');
+    }
+    $L[] = '';
+    foreach (lg_bb_sec_report_lines() as $sl) {
+        $L[] = $sl;
+    }
     $cand = array_filter(lg_bb_rec_sources($hours, 25), function ($s) use ($bl_all) {
         return $s['scanner'] && !in_array($s['ip'], $bl_all['block_all'], true) && !in_array($s['ip'], $bl_all['allow'], true);
     });
@@ -2131,7 +2840,19 @@ function lg_bb_report($hours = 6)
     // and per 10-minute bucket, so a burst is attributable even when the 60-row list below cuts it off.
     $cl = [];
     $bk = [];
+    $tt = [];
     foreach ($rq as $r) {
+        $tk = !empty($r['tn']) ? (string) $r['tn'] : '-';
+        if (!isset($tt[$tk])) {
+            $tt[$tk] = ['n' => 0, 'ms' => 0, 'cpu' => 0, 'max' => 0, 'peak' => 0, 'paths' => []];
+        }
+        $tt[$tk]['n']++;
+        $tt[$tk]['ms'] += $r['ms'];
+        $tt[$tk]['cpu'] += $r['cpu'];
+        $tt[$tk]['max'] = max($tt[$tk]['max'], $r['ms']);
+        $tt[$tk]['peak'] = max($tt[$tk]['peak'], $r['peak']);
+        $tpath = preg_replace('/\?.*$/', '', (string) $r['uri']);
+        $tt[$tk]['paths'][$tpath] = isset($tt[$tk]['paths'][$tpath]) ? $tt[$tk]['paths'][$tpath] + 1 : 1;
         $g = lg_bb_ip_group($r['ip']);
         $ua = lg_bb_ua_short($r['ua']);
         $key = $g . ' | ' . $ua;
@@ -2175,6 +2896,16 @@ function lg_bb_report($hours = 6)
         }
         $L[] = $c['g'] . ' | ' . $c['ua'] . ' | ' . $c['n'] . ' | ' . round($c['ms'] / 1000) . ' | ' . round($c['cpu'] / 1000, 1) . ' | ' . $c['max'] . ' | ' . lg_bb_date('H:i:s', $c['t0']) . '-' . lg_bb_date('H:i:s', $c['t1']) . ' | ' . implode(',', $codes) . ' | ' . count($c['paths']) . ' | ' . implode('; ', $tp);
     }
+    uasort($tt, function ($x, $y) {
+        return $y['ms'] - $x['ms'];
+    });
+    $L[] = '';
+    $L[] = '== SLOW/HEAVY REQUESTS BY TENANT (the tenant the CRM resolved for the request; - = none, e.g. anonymous, login, WordPress itself) ==';
+    $L[] = 'tenant | requests | total wall s | total cpu s | slowest ms | highest peak MB | top path';
+    foreach (array_slice($tt, 0, 12, true) as $tk => $v) {
+        arsort($v['paths']);
+        $L[] = ($tk === '-' ? '-' : lg_bb_tenant_label($tk)) . ' | ' . $v['n'] . ' | ' . round($v['ms'] / 1000) . ' | ' . round($v['cpu'] / 1000, 1) . ' | ' . $v['max'] . ' | ' . $v['peak'] . ' | ' . substr((string) key($v['paths']), 0, 50);
+    }
     ksort($bk);
     $L[] = '';
     $L[] = '== SLOW/HEAVY REQUESTS PER 10 MIN (buckets with 3+; shows the clients behind each burst) ==';
@@ -2205,6 +2936,9 @@ function lg_bb_report($hours = 6)
     $L[] = 'start | why | request | ms | cpu ms | peak MB | queries | http | ip | user agent | detail';
     foreach ($rq as $r) {
         $d = [];
+        if (!empty($r['tn'])) {
+            $d[] = 'tenant ' . lg_bb_tenant_label($r['tn']);
+        }
         if (!empty($r['fatal'])) {
             $d[] = 'FATAL ' . $r['fatal'];
         }
@@ -2464,125 +3198,13 @@ function lg_bb_analyze($rows)
         $inc[] = lg_bb_dberr_incident($win);
     }
     foreach ($orph as $o) {
-        $inc[] = ['t' => $o['started'], 'what' => 'Request never finished (worker killed) — ' . $o['uri'], 'detail' => 'ran ≥ ' . $o['age'] . ' s, IP ' . $o['ip']];
+        $inc[] = ['t' => $o['started'], 'what' => 'Request never finished (worker killed) - ' . $o['uri'], 'detail' => 'ran ≥ ' . $o['age'] . ' s, IP ' . $o['ip']];
     }
     usort($inc, function ($a, $b) {
         return $b['t'] - $a['t'];
     });
     return compact('hb', 'req', 'dberr', 'orph', 'inc');
 }
-
-// ---------------------------------------------------------------- hardening: keep user names private
-
-/*
- * Visitors can list the site's user names three ways without logging in: /wp-json/wp/v2/users, /?author=1
- * (redirects to /author/<username>/) and the users sitemap; the login form also says whether the user name
- * or the password was wrong. Bots use that to aim password guesses. This hides all four from visitors who
- * are not logged in. Logged-in users (the block editor, Elementor, Site Kit) are not affected. On by default,
- * one switch in the page header turns it off.
- */
-function lg_bb_lock_users_on()
-{
-    return (string) get_option('lg_bb_lock_users', '1') !== '0';
-}
-
-add_filter('rest_endpoints', function ($endpoints) {
-    if (!is_array($endpoints) || !lg_bb_lock_users_on() || is_user_logged_in()) {
-        return $endpoints;
-    }
-    foreach (array_keys($endpoints) as $route) {
-        if (preg_match('#^/wp/v2/users(/|$)#', (string) $route)) {
-            unset($endpoints[$route]);
-        }
-    }
-    return $endpoints;
-});
-
-add_action('template_redirect', function () {
-    if (!lg_bb_lock_users_on() || is_user_logged_in()) {
-        return;
-    }
-    // ?author=N (WordPress would redirect it to /author/<username>/) and the author archives themselves.
-    if ((isset($_GET['author']) && $_GET['author'] !== '') || is_author()) {
-        wp_safe_redirect(home_url('/'), 302);
-        exit;
-    }
-}, 0);
-
-add_filter('wp_sitemaps_add_provider', function ($provider, $name) {
-    return (lg_bb_lock_users_on() && $name === 'users') ? false : $provider;
-}, 10, 2);
-
-/** "Unknown user name" and "wrong password" become one message, so the form no longer confirms which user names exist. */
-add_filter('wp_login_errors', function ($errors) {
-    if (!lg_bb_lock_users_on() || !($errors instanceof WP_Error)) {
-        return $errors;
-    }
-    $hit = false;
-    foreach (['invalid_username', 'invalid_email', 'incorrect_password'] as $code) {
-        if ($errors->get_error_message($code) !== '') {
-            $errors->remove($code);
-            $hit = true;
-        }
-    }
-    if ($hit) {
-        $errors->add('lg_bb_invalid', '<strong>Erreur :</strong> identifiant ou mot de passe incorrect. / <strong>Error:</strong> incorrect username or password.');
-    }
-    return $errors;
-});
-
-function lg_bb_hardening_panel()
-{
-    $on = lg_bb_lock_users_on();
-    ?>
-    <h2 id="lg-hardening">Hardening</h2>
-    <p>
-        User-name privacy: <strong><?php echo $on ? 'ON' : 'OFF'; ?></strong>
-        — visitors who are not logged in can no longer list user names through <code>/wp-json/wp/v2/users</code>,
-        <code>/?author=1</code> and the author pages (redirected to the home page), or the users sitemap, and the login form no longer says
-        whether the user name or the password was wrong. Logged-in users are not affected. Turn it off with the switch at the top of the
-        page if a plugin you add later needs the public user list.
-    </p>
-    <?php
-    $cfg = lg_bb_rl_cfg();
-    $st_on = !empty($cfg['static']);
-    $forms = !isset($cfg['static_forms']) || !empty($cfg['static_forms']);
-    ?>
-    <p id="lg-static">
-        Static-site mode: <strong><?php echo $st_on ? 'ON' : 'OFF'; ?></strong>
-        — for a site whose pages are static or cached. Page views still work. For every IP that is <em>not</em> on the allow list,
-        <code>wp-login.php</code>, <code>xmlrpc.php</code>, <code>wp-cron.php</code>, everything under <code>/wp-admin/</code>, any other direct
-        <code>.php</code> file<?php echo $forms ? '' : ', admin-ajax.php and the REST API'; ?> is answered with an instant 403 before WordPress loads,
-        so it costs almost no PHP worker. Off by default. Never use it on the CRM app: it needs the REST API, webhooks and logins from other IPs.
-        When you switch it on, your current IP is added to the allow list.
-    </p>
-    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-        <input type="hidden" name="action" value="lg_bb_login">
-        <?php wp_nonce_field('lg_bb_login'); ?>
-        <label><input type="checkbox" name="static_forms" value="1" <?php checked($forms); ?>> Keep contact forms working (leave admin-ajax.php, admin-post.php and the REST API open)</label>
-        <button class="button" name="op" value="static_save">Save</button>
-    </form>
-    <?php
-    $srows = [];
-    foreach ((array) @glob(lg_bb_rl_dir() . '/sblk-*.php') as $f) {
-        $r = lg_bb_rl_read($f);
-        if (is_array($r) && !empty($r['ip'])) {
-            $srows[] = $r;
-        }
-    }
-    usort($srows, function ($a, $b) {
-        return (int) $b['n'] - (int) $a['n'];
-    });
-    if ($srows) {
-        echo '<table class="widefat striped" style="max-width:900px;margin-top:8px"><thead><tr><th>IP</th><th>Country</th><th>Refused (approx.)</th><th>Last</th><th>Paths</th></tr></thead><tbody>';
-        foreach (array_slice($srows, 0, 15) as $r) {
-            echo '<tr><td>' . esc_html($r['ip']) . '</td><td>' . esc_html(isset($r['cc']) ? $r['cc'] : '') . '</td><td>' . (int) $r['n'] . '</td><td>' . esc_html(lg_bb_date('m-d H:i', (int) (isset($r['last']) ? $r['last'] : 0))) . '</td><td>' . esc_html(implode(' ', (array) (isset($r['paths']) ? $r['paths'] : []))) . '</td></tr>';
-        }
-        echo '</tbody></table>';
-    }
-}
-
-// ---------------------------------------------------------------- admin page design (assets/lgbb-ui.css + lgbb-ui.js)
 
 /** Loads the stylesheet and script of the redesigned admin page (only on our own page). */
 add_action('admin_enqueue_scripts', function ($hook) {
@@ -2595,7 +3217,7 @@ add_action('admin_enqueue_scripts', function ($hook) {
     wp_enqueue_script('lgbb-ui', plugins_url('assets/lgbb-ui.js', __FILE__), [], $ver, true);
 });
 
-/** One switch of the header: a link to the existing admin op, turned into a background request by lgbb-ui.js. */
+/** One switch of the hero: a link to the existing admin op, turned into a background request by lgbb-ui.js. */
 function lg_bb_ui_switch($label, $desc, $icon, $is_on, $op_on, $op_off, $confirm_off = '')
 {
     $url = wp_nonce_url(admin_url('admin-post.php?action=lg_bb_login&op=' . ($is_on ? $op_off : $op_on) . '&ip=0.0.0.0'), 'lg_bb_login');
@@ -2612,41 +3234,28 @@ function lg_bb_ui_kpi($icon, $label, $value, $unit = '', $sub = '', $tone = '')
         . ($sub !== '' ? '<div class="lgbb-kpi__sub">' . esc_html($sub) . '</div>' : '') . '</div>';
 }
 
-/** Temporary blocks still in force right now: failed-login lockouts and probe-shield blocks. */
-function lg_bb_active_blocks()
-{
-    $now = time();
-    $n = 0;
-    foreach (['ip', 'probe'] as $kind) {
-        foreach ((array) @glob(lg_bb_rl_dir() . '/' . $kind . '-*.php') as $f) {
-            $r = lg_bb_rl_read($f);
-            if (is_array($r) && !empty($r['until']) && (int) $r['until'] > $now) {
-                $n++;
-            }
-        }
-    }
-    return $n;
-}
-
 /** Header of the admin page: live server tiles and a switch for every protection. */
 function lg_bb_ui_hero($sys, $hb, $req, $inc)
 {
     $cfg = lg_bb_rl_cfg();
     $gate = lg_bb_gate_installed();
     $lists = lg_bb_rl_lists();
-    $temp = lg_bb_active_blocks();
+    $autos = count(lg_bb_auto_list());
+    $overs = count(lg_bb_over_list());
     $switches = [
         ['Login protection', 'Locks out repeated failed logins', 'dashicons-shield', !empty($cfg['enabled']) && $gate, 'enable', 'disable', 'Turn login protection off?'],
         ['Probe shield', 'Scanners get a 404, then a block', 'dashicons-search', $cfg['probe'] === 'on' && $gate, 'probe_enable', 'probe_disable', 'Turn the probe shield off?'],
-        ['User names private', 'No public user list, generic login error', 'dashicons-privacy', lg_bb_lock_users_on(), 'users_lock_on', 'users_lock_off', 'Make user names public again?'],
-        ['Country filter', 'Needs Cloudflare in front', 'dashicons-admin-site-alt3', $cfg['geo'] === 'block' && $gate, 'geo_enable', 'geo_disable', 'Turn the country filter off?'],
+        ['Automatic blocks', 'Repeat offenders for ' . (int) $cfg['auto_days'] . ' days', 'dashicons-update', !empty($cfg['auto']), 'auto_on', 'auto_off', ''],
+        ['Request-rate limit', 'Floods get a 429 before WordPress', 'dashicons-dashboard', !empty($cfg['rate']), 'rate_on', 'rate_off', 'Turn the request-rate limit off?'],
+        ['wp-cron guard', 'Only the server may call wp-cron.php', 'dashicons-clock', !empty($cfg['cron_guard']), 'cron_on', 'cron_off', ''],
+        ['Under-attack mode', 'High load: anonymous visitors cut to a quarter', 'dashicons-warning', lg_bb_sec_ua_on() && $gate, 'ua_on', 'ua_off', 'Turn under-attack mode off?'],
+        ['404 flood watch', 'Many page misses or refused links: blocked', 'dashicons-visibility', lg_bb_sec_flood_on(), 'flood_on', 'flood_off', ''],
+        ['Country filter', 'Needs Cloudflare in front', 'dashicons-admin-site-alt3', $cfg['geo'] === 'block', 'geo_enable', 'geo_disable', 'Turn the country filter off?'],
     ];
     $n_on = 0;
     foreach ($switches as $sw) {
         $n_on += $sw[3] ? 1 : 0;
     }
-    // Static-site mode is a special-purpose switch (off by default): shown, but not counted in "protections on".
-    $switches[] = ['Static-site mode', 'Only page views reach PHP. For static sites, not the CRM', 'dashicons-lock', !empty($cfg['static']) && $gate, 'static_enable', 'static_disable', 'Turn static-site mode off?'];
     $load = isset($sys['load'][0]) ? (float) $sys['load'][0] : null;
     $cpus = !empty($sys['cpus']) ? max(1, (int) $sys['cpus']) : 1;
     $lt = $load === null ? '' : ($load / $cpus >= 2 ? 'bad' : ($load / $cpus >= 1 ? 'warn' : 'good'));
@@ -2666,7 +3275,7 @@ function lg_bb_ui_hero($sys, $hb, $req, $inc)
         $db_text = 'down';
         $db_tone = 'bad';
     }
-    $blocked = count($lists['block_all']) + count($lists['block']);
+    $blocked = count($lists['block_all']) + $autos;
     ?>
     <hr class="wp-header-end">
     <header class="lgbb-hero">
@@ -2677,7 +3286,7 @@ function lg_bb_ui_hero($sys, $hb, $req, $inc)
                 <p class="lgbb-hero__sub">Flight recorder and shield for this server. Changes apply instantly, no reload.</p>
             </div>
             <div class="lgbb-hero__right">
-                <span class="lgbb-chip <?php echo $n_on >= 3 ? 'is-good' : 'is-warn'; ?>"><span class="dashicons dashicons-yes-alt"></span><?php echo (int) $n_on; ?> of <?php echo (int) (count($switches) - 1); ?> protections on</span>
+                <span class="lgbb-chip <?php echo $n_on >= 4 ? 'is-good' : 'is-warn'; ?>"><span class="dashicons dashicons-yes-alt"></span><?php echo (int) $n_on; ?> of <?php echo (int) count($switches); ?> protections on</span>
                 <span class="lgbb-chip"><span class="dashicons dashicons-clock"></span><?php echo esc_html(lg_bb_tz_label()); ?></span>
                 <span class="lgbb-chip">v<?php echo esc_html(LG_BB_VERSION); ?></span>
             </div>
@@ -2688,8 +3297,8 @@ function lg_bb_ui_hero($sys, $hb, $req, $inc)
             echo lg_bb_ui_kpi('dashicons-database', 'Free memory', $avail === null ? '-' : (string) $avail, 'MB', $total ? 'of ' . $total . ' MB' : '', $mt);
             echo lg_bb_ui_kpi('dashicons-backup', 'Swap used', $swap === null ? '-' : (string) $swap, 'MB', '', $st);
             echo lg_bb_ui_kpi('dashicons-yes', 'MariaDB uptime', $db_text, '', 'last sample', $db_tone);
-            echo lg_bb_ui_kpi('dashicons-dismiss', 'Blocked IPs', (string) $blocked, '', count($lists['block_all']) . ' site-wide, ' . count($lists['block']) . ' logins only', $blocked ? 'warn' : '');
-            echo lg_bb_ui_kpi('dashicons-controls-pause', 'Temporary blocks', (string) $temp, '', 'automatic, in force now', $temp ? 'warn' : '');
+            echo lg_bb_ui_kpi('dashicons-dismiss', 'Blocked IPs', (string) $blocked, '', count($lists['block_all']) . ' site-wide, ' . $autos . ' automatic', $blocked ? 'warn' : '');
+            echo lg_bb_ui_kpi('dashicons-controls-pause', 'Rate-limited', (string) $overs, '', 'IPs over the limit, last day', $overs ? 'warn' : '');
             echo lg_bb_ui_kpi('dashicons-warning', 'Incidents', (string) count($inc), '', 'recorded', count($inc) ? 'bad' : 'good');
             echo lg_bb_ui_kpi('dashicons-clock', 'Slow / heavy', (string) count($req), '', 'requests logged', '');
             ?>
@@ -2719,7 +3328,7 @@ function lg_bb_page()
     ?>
     <div class="wrap lgbb" id="lgbb">
         <?php lg_bb_ui_hero($sys, $hb, $req, $inc); ?>
-        <p class="lgbb-meta">Times are shown in Eastern time (<?php echo esc_html(lg_bb_tz_label()); ?>). Samples every ~30 s (10 s when the server is
+        <p class="lgbb-meta">Times are shown in <?php echo esc_html(lg_bb_tz_label()); ?>. Samples every ~30 s (10 s when the server is
             busy). Log: <?php echo esc_html(count($hb)); ?> samples, <?php echo esc_html(count($req)); ?> heavy/slow
             requests loaded.
             <a class="button" href="<?php echo esc_url($url('lg_bb_download')); ?>">Raw log (.txt)</a>
@@ -2774,7 +3383,7 @@ function lg_bb_page()
 
         <?php lg_bb_login_panel(); ?>
 
-        <?php lg_bb_hardening_panel(); ?>
+        <?php lg_bb_sec_panel(); ?>
 
         <h2>Server right now (what PHP is allowed to see)</h2>
         <p>
@@ -2909,7 +3518,7 @@ function lg_bb_page()
 }
 
 /**
- * wp-config values that matter for load (no secrets — a fixed whitelist) and the
+ * wp-config values that matter for load (no secrets - a fixed whitelist) and the
  * state of WP-Cron: how many events, how overdue, and which hooks pile up.
  */
 function lg_bb_cfg()
@@ -2978,7 +3587,7 @@ function lg_bb_config_panel()
         </tbody>
     </table>
     <p>WP-Cron queue: <strong><?php echo (int) $total; ?></strong> scheduled events (<?php echo (int) $size_kb; ?> KB
-        stored — loaded on every request), <strong><?php echo count($overdue); ?></strong> overdue by more than 60 s.
+        stored - loaded on every request), <strong><?php echo count($overdue); ?></strong> overdue by more than 60 s.
         A hook with dozens of pending events is a pile-up.</p>
     <table class="widefat striped" style="max-width:720px">
         <thead>
@@ -3036,6 +3645,9 @@ function lg_bb_req_table($title, $list)
     echo '<table class="widefat striped"><thead><tr><th>Time</th><th>Why</th><th>Request</th><th>ms</th><th>CPU ms</th><th>Peak MB</th><th>Queries</th><th>Status</th><th>IP</th><th>User agent</th><th>Detail</th></tr></thead><tbody>';
     foreach ($list as $r) {
         $detail = [];
+        if (!empty($r['tn'])) {
+            $detail[] = 'tenant ' . lg_bb_tenant_label($r['tn']);
+        }
         if (!empty($r['fatal'])) {
             $detail[] = 'FATAL ' . $r['fatal'];
         }

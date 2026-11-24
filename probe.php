@@ -1,6 +1,6 @@
 <?php
 /**
- * LG Black Box — server probes. Plain PHP, NO WordPress dependency, so the
+ * LG Black Box - server probes. Plain PHP, NO WordPress dependency, so the
  * db-error.php drop-in can use it while WordPress cannot even reach its database.
  */
 if (!function_exists('lg_bb_read')) {
@@ -11,7 +11,7 @@ if (!function_exists('lg_bb_read')) {
         return is_string($s) ? $s : null;
     }
 
-    /** Load average, memory, swap, memory pressure (PSI) — whatever the host lets PHP see. */
+    /** Load average, memory, swap, memory pressure (PSI) - whatever the host lets PHP see. */
     function lg_bb_sys()
     {
         $o = [];
@@ -54,11 +54,6 @@ if (!function_exists('lg_bb_read')) {
     }
 
     /**
-     * Resident memory by process name, server-wide (all sites on the box, MariaDB, Redis…).
-     * RSS counts shared pages once per process, so php-fpm totals are an upper bound —
-     * good for trends and for spotting a runaway, not for exact accounting.
-     */
-    /**
      * Heuristic: is this path something only a vulnerability scanner asks for (dotfiles, /actuator,
      * credentials.json, terraform.tfvars, phpinfo...)? Used to flag scanner-like IPs in the admin page.
      * Never used to block anything by itself.
@@ -83,11 +78,6 @@ if (!function_exists('lg_bb_read')) {
         if (in_array(basename($p), ['phpinfo', 'phpinfo.php', 'info.php', 'metrics', 'env', 'jenkinsfile', 'dockerfile', 'makefile', 'litellm.yaml', 'litellm.yml'], true)) {
             return true;
         }
-        // JavaScript: a request only reaches PHP when the file does not exist, so a hunt for bundles / config / source maps.
-        // Service workers are exempt (a browser with a stale registration asks for them by itself).
-        if (preg_match('#\.(m?js|map)$#', $p)) {
-            return !preg_match('#^(sw|service-?worker|ngsw-worker|firebase-messaging-sw|pwabuilder-sw|workbox-[a-z0-9]+|onesignal[a-z]*worker|sw-[a-z0-9]+)\.js$#i', basename($p));
-        }
         return (bool) preg_match('#\.(env|ya?ml|json|ini|conf|cfg|toml|properties|tfvars|tfstate|hcl|key|pem|ovpn|bak|sql|old|swp)$#', $p);
     }
 
@@ -109,6 +99,11 @@ if (!function_exists('lg_bb_read')) {
         return $text;
     }
 
+    /**
+     * Resident memory by process name, server-wide (all sites on the box, MariaDB, Redis…).
+     * RSS counts shared pages once per process, so php-fpm totals are an upper bound,
+     * good for trends and for spotting a runaway, not for exact accounting.
+     */
     /** PHP-FPM sets each worker's process title to "php-fpm: pool NAME"; on Cloudways one pool = one application. */
     function lg_bb_pool_from_cmdline($raw)
     {
@@ -128,7 +123,7 @@ if (!function_exists('lg_bb_read')) {
         $count = 0;
         $ticks = [];  // pid => [name, cumulative cpu ticks]
         $run = 0;     // processes in state R (on CPU / runnable)
-        $disk = 0;    // processes in state D (blocked on disk / swap) — both feed the load average
+        $disk = 0;    // processes in state D (blocked on disk / swap) - both feed the load average
         foreach ($dirs as $d) {
             $s = lg_bb_read($d . '/status', 4096);
             if ($s === null || !preg_match('/^Name:\s*(.+)$/m', $s, $n) || !preg_match('/^VmRSS:\s*(\d+)/m', $s, $r)) {

@@ -5,7 +5,7 @@ $root = $PSScriptRoot
 $out = Join-Path $root 'lg-blackbox.zip'
 if (Test-Path $out) { Remove-Item $out }
 $zip = [System.IO.Compression.ZipFile]::Open($out, 'Create')
-foreach ($f in 'gate.php', 'lg-blackbox.php', 'probe.php', 'assets/lgbb-ui.css', 'assets/lgbb-ui.js') {
+foreach ($f in 'gate.php', 'lg-blackbox.php', 'probe.php', 'security.php', 'assets/lgbb-ui.css', 'assets/lgbb-ui.js') {
     [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $root ($f -replace '/', '\')), "lg-blackbox/$f")
 }
 $zip.Dispose()

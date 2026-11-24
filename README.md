@@ -2,7 +2,7 @@
 
 A WordPress plugin that records what a server was doing when a site went down, and shields the site from the most common bot traffic. Built for a shared 4 GB Cloudways server where one app's PHP workers repeatedly exhausted memory and killed MariaDB.
 
-Current version: **1.13.0**. Admin page: **Tools > LG Black Box**.
+This branch is the **multi-tenant CRM edition (2.3.2)**: the same recorder and shield, tagged per tenant, with the CRM's login endpoint covered, plus the security checks and alerts described in [docs/SECURITY_CHECKS.md](docs/SECURITY_CHECKS.md). `main` is the single-tenant line (1.13.0). Admin page: **Tools > LG Black Box**.
 
 ## What it does
 
@@ -25,7 +25,7 @@ Current version: **1.13.0**. Admin page: **Tools > LG Black Box**.
 
 **Manual install:** the folder name must be `lg-blackbox`.
 
-1. Put `gate.php`, `lg-blackbox.php`, `probe.php` and `assets/` in `wp-content/plugins/lg-blackbox/` (upload only these files, not a whole development folder).
+1. Put `gate.php`, `lg-blackbox.php`, `probe.php`, `security.php` and `assets/` in `wp-content/plugins/lg-blackbox/` (upload only these files, not a whole development folder).
 2. Activate it, then open **Tools > LG Black Box**.
 3. Switch on the protections you want. Enabling one adds your current IP to the allow list.
 
@@ -38,6 +38,8 @@ The plugin keeps its data in `wp-content/lg-blackbox/` as `<?php exit; ?>`-heade
 | `lg-blackbox.php` | The plugin: recorder, report, admin page, switches. |
 | `gate.php` | Copied to `wp-content/mu-plugins/lg-blackbox-gate.php` when a shield is enabled; runs before other plugins. |
 | `probe.php` | Scanner-path detection, process / pool sampling helpers. |
+| `security.php` | Alerts, cron watch, file integrity, exposure scan, 404 flood, WordPress event alerts, certificate / PHP / update checks (2.3). |
+| `server/lgbb-sync.php` | Optional cron script that shares automatic blocks between the apps of one server. |
 | `assets/` | Admin page stylesheet and script. |
 
 ## Status
