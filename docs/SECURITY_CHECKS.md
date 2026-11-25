@@ -49,3 +49,8 @@ The guard makes `wp-cron.php` answer only the server itself. It decides who "the
 - The stale-cron alert now carries these steps.
 
 Note: the automatic switch-off cannot tell the real cron from a scanner that sends the same request, so a scanner calling `wp-cron.php` while the tick is already silent can also trigger it. The cost is that `wp-cron.php` is public again, which is the WordPress default.
+
+## 2.4.2: "Recent alerts" and the dashboard time windows
+
+- **Recent alerts** (right under the tiles): everything blocked, refused or flagged in the last 24 hours, newest first, with the time and "x min ago". It gathers the alerts sent, server incidents, automatic blocks, rate-limited IPs, scanner probes, failed and refused logins, refused `wp-cron.php` calls, security checks that found something, and requests slower than 8 s. Six show at once; "Show the other N" opens the rest of the 24 hours.
+- **Time windows on the tiles:** load, memory and swap are live; Incidents, Slow / heavy and Rate-limited count the last 24 hours; Blocked IPs are the blocks in force now. A "Counts: last 24 h" chip and the sub-line of each tile say so. Before 2.4.2 the incident and slow-request tiles counted whatever the log file still held (it is trimmed by size), which is why the number fell as time passed.

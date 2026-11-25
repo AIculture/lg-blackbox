@@ -6,7 +6,7 @@
     // Actions that change state and are safe to run in the background. Downloads, the report file and the abuse preview page are NOT in this list.
     var ACTIONS = /[?&]action=lg_bb_(login|clear|recorder|savequeries)(&|$)/;
     var ICONS = [
-        [/report|paste/i, 'dashicons-media-text'], [/incident/i, 'dashicons-warning'], [/recorder|burst/i, 'dashicons-chart-bar'],
+        [/recent alerts/i, 'dashicons-megaphone'], [/report|paste/i, 'dashicons-media-text'], [/incident/i, 'dashicons-warning'], [/recorder|burst/i, 'dashicons-chart-bar'],
         [/login|protection/i, 'dashicons-shield'], [/probe|scanner/i, 'dashicons-search'], [/country|geo/i, 'dashicons-admin-site-alt3'],
         [/source/i, 'dashicons-networking'], [/automatic|auto/i, 'dashicons-update'], [/rate|cron/i, 'dashicons-dashboard'],
         [/blocked/i, 'dashicons-dismiss'], [/server/i, 'dashicons-desktop'], [/slow|heavy|request/i, 'dashicons-clock'],

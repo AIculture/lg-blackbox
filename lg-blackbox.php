@@ -2,14 +2,14 @@
 /*
 Plugin Name: LG Black Box (server diagnostics, multi-tenant CRM)
 Description: Flight recorder and shield for the multi-tenant CRM host. Samples server load, memory, per-process RSS and MariaDB state every ~30 s, logs slow/heavy requests (tagged with the tenant they ran for) and cron hooks, detects database restarts, records every request compactly to spot bot bursts, and can refuse brute-force logins, off-country logins and scanner probes before WordPress loads. Safe to deactivate and delete.
-Version: 2.4.1
+Version: 2.4.2
 Author: Les Gouttières
 */
 
 if (!defined('ABSPATH'))
     exit;
 
-define('LG_BB_VERSION', '2.4.1');
+define('LG_BB_VERSION', '2.4.2');
 define('LG_BB_PROBE', plugin_dir_path(__FILE__) . 'probe.php');
 require_once LG_BB_PROBE;
 require_once plugin_dir_path(__FILE__) . 'security.php';
@@ -3356,6 +3356,123 @@ function lg_bb_ui_kpi($icon, $label, $value, $unit = '', $sub = '', $tone = '')
         . ($sub !== '' ? '<div class="lgbb-kpi__sub">' . esc_html($sub) . '</div>' : '') . '</div>';
 }
 
+/** The dashboard tiles and the "Recent alerts" list count what happened in this many hours (the raw log reaches back as far as its size allows). */
+define('LG_BB_DASH_HOURS', 24);
+
+/** How many recent alerts show at once; the rest of the 24 hours opens under "older". */
+define('LG_BB_RECENT_SHOWN', 6);
+
+/**
+ * Everything worth a look in the last $hours hours, newest first: alerts sent, incidents, automatic blocks, rate-limited IPs,
+ * scanner probes, failed or refused logins, refused cron calls, failing security checks and very slow requests.
+ * Each item: t, tone (bad|warn|info), kind, what, detail.
+ */
+function lg_bb_recent_events($inc, $req, $hours = LG_BB_DASH_HOURS)
+{
+    $since = time() - (int) $hours * 3600;
+    $ev = [];
+    $add = function ($t, $tone, $kind, $what, $detail = '') use (&$ev, $since) {
+        if ((int) $t > 0 && (int) $t >= $since) {
+            $ev[] = ['t' => (int) $t, 'tone' => $tone, 'kind' => $kind, 'what' => (string) $what, 'detail' => (string) $detail];
+        }
+    };
+    $who = function ($ip, $cc) {
+        return $ip . ($cc !== '' && $cc !== null ? ' (' . $cc . ')' : '');
+    };
+
+    // Alerts the plugin raised (the e-mail log).
+    $al = lg_bb_sec_read('alerts');
+    foreach ((array) (isset($al['log']) ? $al['log'] : []) as $a) {
+        if (!is_array($a) || !isset($a['t']) || strpos((string) (isset($a['key']) ? $a['key'] : ''), 'digest-') === 0) {
+            continue;
+        }
+        $sent = isset($a['sent']) ? (string) $a['sent'] : '';
+        $add($a['t'], isset($a['level']) && $a['level'] === 'crit' ? 'bad' : (isset($a['level']) && $a['level'] === 'info' ? 'info' : 'warn'), 'Alert',
+            isset($a['subject']) ? $a['subject'] : '', $sent === 'sent' ? 'e-mailed' : ($sent === 'FAILED' ? 'e-mail FAILED to send' : 'not e-mailed (' . $sent . ')'));
+    }
+    // Server incidents.
+    foreach ((array) $inc as $i) {
+        $add($i['t'], 'bad', 'Server', $i['what'], isset($i['detail']) ? $i['detail'] : '');
+    }
+    // Very slow requests.
+    foreach ((array) $req as $r) {
+        if (isset($r['ms']) && (int) $r['ms'] >= 8000) {
+            $add($r['t'], 'warn', 'Slow request', (isset($r['m']) ? $r['m'] . ' ' : '') . (isset($r['uri']) ? $r['uri'] : ''),
+                round((int) $r['ms'] / 1000, 1) . ' s, status ' . (isset($r['st']) ? (int) $r['st'] : '?') . ', IP ' . (isset($r['ip']) ? $r['ip'] : '?') . (!empty($r['why']) ? ', ' . $r['why'] : ''));
+        }
+    }
+    // Blocks the plugin or the gate put in force.
+    foreach (lg_bb_auto_list() as $r) {
+        $add($r['first'], 'warn', 'Blocked', 'IP ' . $who($r['ip'], isset($r['cc']) ? (string) $r['cc'] : '') . ' put on the automatic block list',
+            (isset($r['why']) ? $r['why'] : '') . ', until ' . lg_bb_date('M j H:i', (int) $r['until']) . (!empty($r['n']) ? ', ' . (int) $r['n'] . ' requests refused so far' : ''));
+    }
+    foreach (lg_bb_over_list() as $r) {
+        $add($r['last'], 'warn', 'Rate limit', 'IP ' . $r['ip'] . ' went over the request limit in ' . (int) $r['n'] . ' separate minute(s)',
+            'last on ' . (isset($r['p']) ? $r['p'] : '') . (!empty($r['limit']) ? ', limit ' . (int) $r['limit'] . ' requests/min' : ''));
+    }
+    foreach (lg_bb_probe_table($hours) as $r) {
+        $add($r['last'], $r['blocked'] ? 'warn' : 'info', $r['blocked'] ? 'Scanner blocked' : 'Scanner probe',
+            'IP ' . $who($r['ip'], $r['cc']) . ' asked for ' . (int) $r['n'] . ' junk path(s)', trim($r['paths'] . ($r['status'] !== '' ? ' - ' . $r['status'] : '')));
+    }
+    foreach (lg_bb_auth_table($hours) as $r) {
+        if (!empty($r['f'])) {
+            $add($r['last'], 'warn', 'Login', (int) $r['f'] . ' failed login(s) from ' . $who($r['ip'], $r['cc']),
+                ($r['kinds'] !== '' ? $r['kinds'] . ', ' : '') . (int) $r['n'] . ' attempt(s)' . ($r['status'] !== '' ? ' - ' . $r['status'] : ''));
+        } elseif (!empty($r['geo'])) {
+            $add($r['last'], 'info', 'Country filter', 'IP ' . $who($r['ip'], $r['cc']) . ' refused', $r['status']);
+        }
+    }
+    // The gate refused a wp-cron.php call.
+    $dn = lg_bb_rl_read(lg_bb_rl_dir() . '/cron-denied.php');
+    if (is_array($dn) && !empty($dn['t'])) {
+        $add($dn['t'], 'warn', 'Cron guard', 'wp-cron.php refused for ' . (isset($dn['ip']) ? $dn['ip'] : '?'),
+            'If that is this server, press "re-detect" under the wp-cron guard (the plugin switches the guard off by itself when the cron stalls).');
+    }
+    // Security checks that found something.
+    foreach ((array) lg_bb_sec_read('jobs') as $name => $j) {
+        if ($name !== 'digest' && is_array($j) && isset($j['ok']) && !$j['ok'] && !empty($j['t'])) {
+            $add($j['t'], 'warn', 'Check', ucfirst((string) $name) . ' check found something', isset($j['summary']) ? $j['summary'] : '');
+        }
+    }
+    usort($ev, function ($a, $b) {
+        return $b['t'] - $a['t'];
+    });
+    return array_slice($ev, 0, 150);
+}
+
+/** "Recent alerts": a few at once, the rest of the last 24 hours behind a fold. */
+function lg_bb_recent_panel($inc, $req)
+{
+    $ev = lg_bb_recent_events($inc, $req, LG_BB_DASH_HOURS);
+    $tones = ['bad' => 'Serious', 'warn' => 'Flagged', 'info' => 'Notice'];
+    $rows = function ($list) use ($tones) {
+        foreach ($list as $e) {
+            echo '<tr><td style="white-space:nowrap">' . lg_bb_t($e['t']) . '<br><small>' . esc_html(lg_bb_sec_ago($e['t'])) . '</small></td>'
+                . '<td><span class="lgbb-ev is-' . esc_attr($e['tone']) . '">' . esc_html($tones[$e['tone']]) . '</span></td>'
+                . '<td>' . esc_html($e['kind']) . '</td><td>' . esc_html($e['what']) . '</td><td>' . esc_html($e['detail']) . '</td></tr>';
+        }
+    };
+    $head = '<thead><tr><th style="width:120px">When</th><th style="width:80px">Level</th><th style="width:120px">Type</th><th>What</th><th>Detail</th></tr></thead>';
+    $first = array_slice($ev, 0, LG_BB_RECENT_SHOWN);
+    $older = array_slice($ev, LG_BB_RECENT_SHOWN);
+    ?>
+    <h2 id="lg-recent">Recent alerts</h2>
+    <p>Everything blocked, refused or flagged in the <strong>last <?php echo (int) LG_BB_DASH_HOURS; ?> hours</strong>, newest first
+        (<?php echo (int) count($ev); ?> in all; times in <?php echo esc_html(lg_bb_tz_label()); ?>). Older events are not kept here.</p>
+    <?php if (!$ev): ?>
+        <p>Nothing blocked or flagged in the last <?php echo (int) LG_BB_DASH_HOURS; ?> hours.</p>
+    <?php else: ?>
+        <table class="widefat striped"><?php echo $head; ?><tbody><?php $rows($first); ?></tbody></table>
+        <?php if ($older): ?>
+            <details class="lgbb-older" style="margin-top:10px">
+                <summary style="cursor:pointer;font-weight:600">Show the other <?php echo (int) count($older); ?> from the last <?php echo (int) LG_BB_DASH_HOURS; ?> hours</summary>
+                <table class="widefat striped" style="margin-top:8px"><?php echo $head; ?><tbody><?php $rows($older); ?></tbody></table>
+            </details>
+        <?php endif; ?>
+    <?php endif; ?>
+    <?php
+}
+
 /** Header of the admin page: live server tiles and a switch for every protection. */
 function lg_bb_ui_hero($sys, $hb, $req, $inc)
 {
@@ -3398,6 +3515,14 @@ function lg_bb_ui_hero($sys, $hb, $req, $inc)
         $db_tone = 'bad';
     }
     $blocked = count($lists['block_all']) + $autos;
+    // Incidents and slow requests are counted over a fixed clock window, not over "whatever the log file still holds".
+    $win_from = time() - LG_BB_DASH_HOURS * 3600;
+    $inc_w = array_filter((array) $inc, function ($i) use ($win_from) {
+        return (int) $i['t'] >= $win_from;
+    });
+    $req_w = array_filter((array) $req, function ($r) use ($win_from) {
+        return (int) $r['t'] >= $win_from;
+    });
     ?>
     <hr class="wp-header-end">
     <header class="lgbb-hero">
@@ -3410,19 +3535,20 @@ function lg_bb_ui_hero($sys, $hb, $req, $inc)
             <div class="lgbb-hero__right">
                 <span class="lgbb-chip <?php echo $n_on >= 4 ? 'is-good' : 'is-warn'; ?>"><span class="dashicons dashicons-yes-alt"></span><?php echo (int) $n_on; ?> of <?php echo (int) count($switches); ?> protections on</span>
                 <span class="lgbb-chip"><span class="dashicons dashicons-clock"></span><?php echo esc_html(lg_bb_tz_label()); ?></span>
+                <span class="lgbb-chip" title="Load, memory and swap are live. Incidents, slow requests and rate-limited IPs are counted over the last <?php echo (int) LG_BB_DASH_HOURS; ?> hours. Blocked IPs are the blocks in force now."><span class="dashicons dashicons-backup"></span>Counts: last <?php echo (int) LG_BB_DASH_HOURS; ?> h</span>
                 <span class="lgbb-chip">v<?php echo esc_html(LG_BB_VERSION); ?></span>
             </div>
         </div>
         <div class="lgbb-kpis">
             <?php
             echo lg_bb_ui_kpi('dashicons-dashboard', 'Server load', $load === null ? '-' : (string) $load, $cpus > 1 ? '/ ' . $cpus . ' cores' : '/ 1 core', 'right now', $lt);
-            echo lg_bb_ui_kpi('dashicons-database', 'Free memory', $avail === null ? '-' : (string) $avail, 'MB', $total ? 'of ' . $total . ' MB' : '', $mt);
-            echo lg_bb_ui_kpi('dashicons-backup', 'Swap used', $swap === null ? '-' : (string) $swap, 'MB', '', $st);
+            echo lg_bb_ui_kpi('dashicons-database', 'Free memory', $avail === null ? '-' : (string) $avail, 'MB', ($total ? 'of ' . $total . ' MB, ' : '') . 'right now', $mt);
+            echo lg_bb_ui_kpi('dashicons-backup', 'Swap used', $swap === null ? '-' : (string) $swap, 'MB', 'right now', $st);
             echo lg_bb_ui_kpi('dashicons-yes', 'MariaDB uptime', $db_text, '', 'last sample', $db_tone);
-            echo lg_bb_ui_kpi('dashicons-dismiss', 'Blocked IPs', (string) $blocked, '', count($lists['block_all']) . ' site-wide, ' . $autos . ' automatic', $blocked ? 'warn' : '');
-            echo lg_bb_ui_kpi('dashicons-controls-pause', 'Rate-limited', (string) $overs, '', 'IPs over the limit, last day', $overs ? 'warn' : '');
-            echo lg_bb_ui_kpi('dashicons-warning', 'Incidents', (string) count($inc), '', 'recorded', count($inc) ? 'bad' : 'good');
-            echo lg_bb_ui_kpi('dashicons-clock', 'Slow / heavy', (string) count($req), '', 'requests logged', '');
+            echo lg_bb_ui_kpi('dashicons-dismiss', 'Blocked IPs', (string) $blocked, '', count($lists['block_all']) . ' site-wide, ' . $autos . ' automatic, in force now', $blocked ? 'warn' : '');
+            echo lg_bb_ui_kpi('dashicons-controls-pause', 'Rate-limited', (string) $overs, '', 'IPs over the limit, last ' . LG_BB_DASH_HOURS . ' h', $overs ? 'warn' : '');
+            echo lg_bb_ui_kpi('dashicons-warning', 'Incidents', (string) count($inc_w), '', 'last ' . LG_BB_DASH_HOURS . ' h', count($inc_w) ? 'bad' : 'good');
+            echo lg_bb_ui_kpi('dashicons-clock', 'Slow / heavy', (string) count($req_w), '', 'requests, last ' . LG_BB_DASH_HOURS . ' h', '');
             ?>
         </div>
         <div class="lgbb-switches">
@@ -3450,13 +3576,24 @@ function lg_bb_page()
     ?>
     <div class="wrap lgbb" id="lgbb">
         <?php lg_bb_ui_hero($sys, $hb, $req, $inc); ?>
+        <?php
+        $first_t = [];
+        foreach ([$hb, $req] as $set) {
+            if ($set) {
+                $first_t[] = (int) reset($set)['t'];
+            }
+        }
+        ?>
         <p class="lgbb-meta">Times are shown in <?php echo esc_html(lg_bb_tz_label()); ?>. Samples every ~30 s (10 s when the server is
             busy). Log: <?php echo esc_html(count($hb)); ?> samples, <?php echo esc_html(count($req)); ?> heavy/slow
-            requests loaded.
+            requests loaded<?php echo $first_t ? ', going back to ' . esc_html(lg_bb_date('M j H:i', min($first_t))) : ''; ?>. The tiles above count the last
+            <?php echo (int) LG_BB_DASH_HOURS; ?> hours.
             <a class="button" href="<?php echo esc_url($url('lg_bb_download')); ?>">Raw log (.txt)</a>
             <a class="button" href="<?php echo esc_url($url('lg_bb_clear')); ?>"
                 onclick="return confirm('Delete the log?')">Clear</a>
         </p>
+
+        <?php lg_bb_recent_panel($inc, $req); ?>
 
         <?php lg_bb_reco_panel(); ?>
 
@@ -3483,6 +3620,8 @@ function lg_bb_page()
             <p>None recorded yet. After the next crash, a "MariaDB restarted" line appears here with the server state just
                 before it.</p>
         <?php else: ?>
+            <p>Every incident still in the log (<?php echo (int) count($inc); ?>), not only the last <?php echo (int) LG_BB_DASH_HOURS; ?> hours counted in the tile above. The log is
+                trimmed by size, so old incidents drop off as new records arrive.</p>
             <table class="widefat striped">
                 <thead>
                     <tr>
