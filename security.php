@@ -286,15 +286,43 @@ function lg_bb_sec_cron_check()
             $st['stale_since'] = end($t);
             lg_bb_sec_write('ticks', $st);
         }
+        // Was it our own wp-cron guard? The gate leaves a note each time it refuses a wp-cron.php call. A refusal since the last tick,
+        // with the tick silent, means the guard is what stopped the server's cron: re-detect the server's addresses, and if the
+        // refused address is still not one of them, switch the guard off (file switch, so the setting itself is kept) and say so.
+        $guard_note = '';
+        $rcfg = lg_bb_rl_cfg();
+        $deny = lg_bb_rl_read(lg_bb_rl_dir() . '/cron-denied.php');
+        if (!empty($rcfg['cron_guard']) && is_array($deny) && (int) $deny['t'] > end($t) - 60) {
+            lg_bb_self_refresh(true);
+            $cip = isset($deny['ip']) ? (string) $deny['ip'] : '?';
+            if (!lg_bb_sec_is_self_fresh($cip)) {
+                @file_put_contents(lg_bb_rl_dir() . '/cron-guard-off', 'switched off automatically ' . gmdate('c') . ', it refused ' . $cip . "\n");
+                $guard_note = 'CAUSE FOUND: the wp-cron guard was refusing this server\'s own cron (refused address ' . $cip . '). '
+                    . "It has been switched off automatically, so the jobs resume within minutes.\n"
+                    . 'To turn it back on later: Tools > LG Black Box > wp-cron guard > turn on, once the server addresses shown there are right.' . "\n";
+            } else {
+                $guard_note = "The wp-cron guard had refused the server's cron, the server addresses were re-detected and the refused address is now accepted.\n";
+            }
+        }
         lg_bb_alert(
             'cron-stale',
             'Scheduled jobs have stopped',
             'No scheduled tick for ' . (int) round($age / 60) . ' minutes (it normally runs every ' . max(1, (int) round($gap / 60)) . " min).\n"
+            . $guard_note
             . "Until it is back: the QuickBooks queue, receipts auto-confirm, polling, nightly backups and cleanups do not run.\n"
-            . 'Check the server crontab (Cloudways master user) and that DISABLE_WP_CRON is not blocking the call to wp-cron.php.',
+            . "Check the server crontab (Cloudways master user) and that DISABLE_WP_CRON is not blocking the call to wp-cron.php.\n"
+            . "Fast fix if the Black Box wp-cron guard is the cause: Tools > LG Black Box > wp-cron guard > turn off, or on the server run\n"
+            . '  wp lg-bb cron-guard off   (or: touch wp-content/lg-blackbox/rl/cron-guard-off)',
             'crit'
         );
     }
+}
+
+/** Is $ip one of the server's own addresses, read fresh from rl/self.php (lg_bb_sec_is_self() caches for the request). */
+function lg_bb_sec_is_self_fresh($ip)
+{
+    $j = lg_bb_rl_read(lg_bb_rl_dir() . '/self.php');
+    return is_array($j) && !empty($j['ips']) && in_array($ip, (array) $j['ips'], true);
 }
 
 function lg_bb_sec_load_watch()
@@ -877,7 +905,7 @@ function lg_bb_sec_selfscan_targets()
 {
     $legacy = ['crm_qb_debug_log.txt', 'crm_debug_log.txt', 'crm_twillio_webhook_log.txt', 'crm_twillio_error_log.txt', 'crm_contract_log.txt', 'crm_receipts_unauthorized_log.txt'];
     $t = [
-        ['/readme.html', 'absent'], ['/license.txt', 'absent'], ['/wp-sitemap.xml', 'absent'], ['/wp-sitemap-users-1.xml', 'absent'],
+        ['/readme.html', 'absent'], ['/license.txt', 'absent'], ['/wp-sitemap-users-1.xml', 'absent'], // (the ordinary sitemap is normal on a public site; only the users one names accounts)
         ['/?author=1', 'author'], ['/xmlrpc.php', 'xmlrpc'], ['/wp-json/wp/v2/users', 'absent'], ['/wp-json/', 'restindex'],
         ['/wp-content/debug.log', 'absent'], ['/.env', 'absent'], ['/.git/config', 'absent'], ['/wp-config.php.bak', 'absent'],
         ['/wp-config.php~', 'absent'], ['/backup.sql', 'absent'], ['/db.sql', 'absent'], ['/phpinfo.php', 'absent'],
@@ -1375,5 +1403,9 @@ function lg_bb_sec_report_lines()
         $L[] = $name . ': ' . ($j ? ($j['ok'] ? 'OK' : 'CHECK') . ', ' . lg_bb_sec_ago($j['t']) . ', ' . $j['summary'] : 'never run');
     }
     $L[] = 'under-attack mode: ' . (lg_bb_sec_ua_on() ? 'on' : 'off') . '; 404 flood watch: ' . (lg_bb_sec_flood_on() ? 'on' : 'off');
+    if (function_exists('lg_bb_reco_summary')) {
+        list($ron, $rtot) = lg_bb_reco_summary();
+        $L[] = 'recommended protection: ' . $ron . ' of ' . $rtot . ' on' . ($ron < $rtot ? ' (press "Enable recommended protection" on Tools > LG Black Box)' : '');
+    }
     return $L;
 }

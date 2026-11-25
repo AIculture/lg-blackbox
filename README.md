@@ -2,7 +2,7 @@
 
 A WordPress plugin that records what a server was doing when a site went down, and shields the site from the most common bot traffic. Built for a shared 4 GB Cloudways server where one app's PHP workers repeatedly exhausted memory and killed MariaDB.
 
-This branch is the **multi-tenant CRM edition (2.3.2)**: the same recorder and shield, tagged per tenant, with the CRM's login endpoint covered, plus the security checks and alerts described in [docs/SECURITY_CHECKS.md](docs/SECURITY_CHECKS.md). `main` is the single-tenant line (1.13.0). Admin page: **Tools > LG Black Box**.
+This branch is the **multi-tenant CRM edition (2.4.1)**: the same recorder and shield, tagged per tenant, with the CRM's login endpoint covered, plus the security checks and alerts described in [docs/SECURITY_CHECKS.md](docs/SECURITY_CHECKS.md). `main` is the single-tenant line (1.13.0). Admin page: **Tools > LG Black Box**.
 
 ## What it does
 

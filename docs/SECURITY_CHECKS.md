@@ -31,3 +31,21 @@ budget so a scheduled tick never overruns. Written for PHP 7.4 and later.
 ## Roll back
 
 Restore the previous plugin folder and, if it changed, `wp-content/mu-plugins/lg-blackbox-gate.php`. Remove the sync cron line if you installed it.
+
+## wp-cron guard: the 2.4.1 fix and how to switch it off fast
+
+The guard makes `wp-cron.php` answer only the server itself. It decides who "the server itself" is from `rl/self.php`.
+
+**What went wrong (2.4.0 and earlier):** the server's address was found by resolving the site's own name. When the site's DNS went behind Cloudflare, the name resolved to a Cloudflare edge address, that was stored as "the server", and the real server's cron was refused. Every scheduled job stopped (the "scheduled jobs have stopped" alert fired after 48 minutes).
+
+**2.4.1:**
+- Cloudflare edge addresses are never stored as the server. The address the machine really uses to reach the Internet is added, and an address seen before is kept for 30 days, so one odd lookup cannot remove the real one. The list is rebuilt on every plugin update and every 6 hours.
+- The gate (v10) notes every refused `wp-cron.php` call. If the tick is silent and that refused address is not one of the server's, the plugin **switches the guard off by itself** and says so in the alert; the setting is kept, only the file switch below is set.
+- Fast ways to switch it off, none of which needs the site to work:
+  - `wp lg-bb cron-guard off` (also `on`, `redetect`, `status`)
+  - create an empty file `wp-content/lg-blackbox/rl/cron-guard-off` (delete it to bring the guard back)
+  - define `LG_BB_CRON_GUARD_OFF` as `true` in `wp-config.php`
+  - or Tools > LG Black Box > wp-cron guard > turn off, with a "re-detect" link next to the list of addresses it lets through.
+- The stale-cron alert now carries these steps.
+
+Note: the automatic switch-off cannot tell the real cron from a scanner that sends the same request, so a scanner calling `wp-cron.php` while the tick is already silent can also trigger it. The cost is that `wp-cron.php` is public again, which is the WordPress default.

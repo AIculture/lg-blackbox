@@ -3,7 +3,7 @@
 Plugin Name: LG Black Box login gate
 Description: Managed by the LG Black Box plugin (Tools > LG Black Box), multi-tenant CRM edition. Before the other plugins load it can: refuse login requests from IPs that failed too often, refuse login pages for countries outside an allowed list, and answer scanner probes for junk files (.env, /actuator, credentials.json...) with an instant 404. Delete this file, or use the Disable buttons, to remove it.
 */
-/* LG-BLACKBOX-GATE v9 */
+/* LG-BLACKBOX-GATE v10 */
 if (!defined('ABSPATH')) {
     return;
 }
@@ -455,7 +455,9 @@ if (!function_exists('lg_bb_gate_run')) {
         $blockall = !empty($l0['block_all']) && is_array($l0['block_all']);   // IPs refused on every request
         $auto = !empty($cfg['auto']);                                   // automatic block list of repeat offenders
         $rate = !empty($cfg['rate']);                                   // per-IP request-rate limit
-        $cronguard = !empty($cfg['cron_guard']);                        // wp-cron.php answers only the server itself
+        // wp-cron.php answers only the server itself. Emergency off switches that need no WordPress: the constant LG_BB_CRON_GUARD_OFF,
+        // or an empty file rl/cron-guard-off (touch it by SSH/SFTP; delete it to turn the guard back on).
+        $cronguard = !empty($cfg['cron_guard']) && !(defined('LG_BB_CRON_GUARD_OFF') && LG_BB_CRON_GUARD_OFF) && !is_file($dir . '/cron-guard-off');
         if (!$prot && !$geo && !$probe && !$blockall && !$auto && !$rate && !$cronguard) {
             return;
         }
@@ -513,6 +515,13 @@ if (!function_exists('lg_bb_gate_run')) {
             $selfs = lg_bb_gate_self_ips($dir);
             // Fail open: with no known server address (self.php not written yet) the guard does nothing, so it can never stop the server's own cron.
             if ($selfs && $cip !== '' && !in_array($cip, $selfs, true) && !(isset($_SERVER['SERVER_ADDR']) && $_SERVER['SERVER_ADDR'] === $cip) && (empty($l0['allow']) || !in_array($cip, $l0['allow'], true))) {
+                // Remember who was refused (once a minute at most): if the server's own cron is the one refused, the plugin sees it here
+                // and switches the guard off by itself instead of leaving every scheduled job stopped.
+                $dn = $dir . '/cron-denied.php';
+                clearstatcache(true, $dn);
+                if (!is_file($dn) || time() - (int) @filemtime($dn) >= 60) {
+                    @file_put_contents($dn, '<?php exit;?>' . json_encode(['ip' => $cip, 't' => time(), 'ua' => substr(isset($_SERVER['HTTP_USER_AGENT']) ? (string) $_SERVER['HTTP_USER_AGENT'] : '', 0, 60)]), LOCK_EX);
+                }
                 lg_bb_gate_deny(403, 'Not allowed.');
             }
         }

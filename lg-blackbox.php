@@ -2,17 +2,19 @@
 /*
 Plugin Name: LG Black Box (server diagnostics, multi-tenant CRM)
 Description: Flight recorder and shield for the multi-tenant CRM host. Samples server load, memory, per-process RSS and MariaDB state every ~30 s, logs slow/heavy requests (tagged with the tenant they ran for) and cron hooks, detects database restarts, records every request compactly to spot bot bursts, and can refuse brute-force logins, off-country logins and scanner probes before WordPress loads. Safe to deactivate and delete.
-Version: 2.3.2
+Version: 2.4.1
 Author: Les Gouttières
 */
 
 if (!defined('ABSPATH'))
     exit;
 
-define('LG_BB_VERSION', '2.3.2');
+define('LG_BB_VERSION', '2.4.1');
 define('LG_BB_PROBE', plugin_dir_path(__FILE__) . 'probe.php');
 require_once LG_BB_PROBE;
 require_once plugin_dir_path(__FILE__) . 'security.php';
+require_once plugin_dir_path(__FILE__) . 'hardening.php';
+require_once plugin_dir_path(__FILE__) . 'recommended.php';
 
 // Thresholds - override in wp-config.php with define() if too noisy / too quiet.
 if (!defined('LG_BB_SLOW_S'))
@@ -1270,28 +1272,118 @@ function lg_bb_auto_list()
 }
 
 /**
- * The server's own public addresses, kept in rl/self.php for the gate (its own cron and loopback requests must never be refused).
- * Behind Apache PHP sees SERVER_ADDR = 127.0.0.1, so the address comes from the site's DNS name (and the hostname). Refreshed every 6 hours,
- * and only on a site that already has a Black Box configuration.
+ * Is this address a CDN or proxy edge (Cloudflare) rather than the server? A site that sits behind Cloudflare resolves to the
+ * edge, and the edge is never "the server itself": taking it for the server (2.3.2 did) made the wp-cron guard refuse the real
+ * server's cron and stopped every scheduled job.
  */
-add_action('init', function () {
-    $dir = lg_bb_rl_dir();
-    if (!is_file($dir . '/config.php')) {
-        return;
+function lg_bb_is_cdn_ip($ip)
+{
+    static $v4 = ['173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20',
+        '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22'];
+    $b = @inet_pton($ip);
+    if ($b === false) {
+        return false;
     }
-    $f = $dir . '/self.php';
-    if (is_file($f) && filemtime($f) > time() - 6 * 3600) {
-        return;
+    if (strlen($b) === 16) {
+        return strncmp($b, @inet_pton('2606:4700::'), 4) === 0 || strncmp($b, @inet_pton('2400:cb00::'), 4) === 0 || strncmp($b, @inet_pton('2405:b500::'), 4) === 0
+            || strncmp($b, @inet_pton('2803:f800::'), 4) === 0 || strncmp($b, @inet_pton('2a06:98c0::'), 4) === 0 || strncmp($b, @inet_pton('2c0f:f248::'), 4) === 0;
     }
-    $ips = [];
-    $host = wp_parse_url(home_url(), PHP_URL_HOST);
-    foreach ([is_string($host) ? gethostbyname($host) : '', isset($_SERVER['SERVER_ADDR']) ? (string) $_SERVER['SERVER_ADDR'] : '', gethostbyname((string) gethostname())] as $c) {
-        if (filter_var($c, FILTER_VALIDATE_IP) && lg_bb_rl_public_ip($c) && !in_array($c, $ips, true)) {
-            $ips[] = $c;
+    $n = ip2long($ip);
+    foreach ($v4 as $r) {
+        list($net, $bits) = explode('/', $r);
+        $mask = -1 << (32 - (int) $bits);
+        if (($n & $mask) === (ip2long($net) & $mask)) {
+            return true;
         }
     }
-    lg_bb_rl_write($f, ['ips' => $ips, 't' => time()]);
+    return false;
+}
+
+/**
+ * The server's own public addresses, kept in rl/self.php for the gate (its own cron and loopback requests must never be refused).
+ * Behind Apache PHP sees SERVER_ADDR = 127.0.0.1, so the candidates are: the site's DNS name, the hostname, and the address the
+ * machine really uses to reach the Internet (a UDP socket that sends nothing). CDN/proxy addresses are never kept. An address seen
+ * before stays for 30 days, so one odd lookup can never remove the real one. Refreshed every 6 hours and whenever the plugin version
+ * changes, only on a site that already has a Black Box configuration; $force skips those checks (admin button, WP-CLI).
+ * Returns the list now in force.
+ */
+function lg_bb_self_refresh($force = false)
+{
+    $dir = lg_bb_rl_dir();
+    $f = $dir . '/self.php';
+    if (!$force && !is_file($dir . '/config.php')) {
+        return [];
+    }
+    $old = lg_bb_rl_read($f);
+    $old = is_array($old) ? $old : [];
+    if (!$force && is_file($f) && filemtime($f) > time() - 6 * 3600 && isset($old['v']) && $old['v'] === LG_BB_VERSION) {
+        return isset($old['ips']) && is_array($old['ips']) ? $old['ips'] : [];
+    }
+    $cands = [];
+    $host = wp_parse_url(home_url(), PHP_URL_HOST);
+    $cands[] = is_string($host) ? gethostbyname($host) : '';
+    $cands[] = isset($_SERVER['SERVER_ADDR']) ? (string) $_SERVER['SERVER_ADDR'] : '';
+    $cands[] = gethostbyname((string) gethostname());
+    $so = @stream_socket_client('udp://192.0.2.1:53', $en, $es, 1);
+    if ($so) {
+        $nm = (string) @stream_socket_get_name($so, false);
+        $cands[] = preg_replace('/:\d+$/', '', $nm);
+        @fclose($so);
+    }
+    $now = time();
+    $seen = [];
+    foreach ((array) (isset($old['seen']) ? $old['seen'] : []) as $ip => $t) {
+        if (is_string($ip) && (int) $t > $now - 30 * 86400 && filter_var($ip, FILTER_VALIDATE_IP) && !lg_bb_is_cdn_ip($ip)) {
+            $seen[$ip] = (int) $t;
+        }
+    }
+    foreach ($cands as $c) {
+        if (is_string($c) && filter_var($c, FILTER_VALIDATE_IP) && lg_bb_rl_public_ip($c) && !lg_bb_is_cdn_ip($c)) {
+            $seen[$c] = $now;
+        }
+    }
+    $ips = array_keys($seen);
+    lg_bb_rl_write($f, ['ips' => $ips, 'seen' => $seen, 'v' => LG_BB_VERSION, 't' => $now]);
+    return $ips;
+}
+
+add_action('init', function () {
+    lg_bb_self_refresh(false);
 }, 2);
+
+/**
+ * WP-CLI, for fixing a stuck cron from the server in seconds (it never goes through the web gate):
+ *   wp lg-bb cron-guard status|off|on|redetect
+ */
+if (defined('WP_CLI') && WP_CLI && class_exists('WP_CLI')) {
+    WP_CLI::add_command('lg-bb cron-guard', function ($args) {
+        $act = isset($args[0]) ? $args[0] : 'status';
+        $dir = lg_bb_rl_dir();
+        $off = $dir . '/cron-guard-off';
+        if ($act === 'off') {
+            @file_put_contents($off, 'switched off by WP-CLI ' . gmdate('c') . "\n");
+            WP_CLI::success('wp-cron guard is off (file rl/cron-guard-off). Scheduled jobs resume on the next cron call.');
+        } elseif ($act === 'on') {
+            @unlink($off);
+            @unlink($dir . '/cron-denied.php');
+            $ips = lg_bb_self_refresh(true);
+            $cfg = lg_bb_rl_cfg();
+            $cfg['cron_guard'] = 1;
+            lg_bb_rl_write($dir . '/config.php', $cfg);
+            WP_CLI::success('wp-cron guard is on. Server addresses let through: ' . ($ips ? implode(', ', $ips) : 'none known (guard inactive)'));
+        } elseif ($act === 'redetect') {
+            $ips = lg_bb_self_refresh(true);
+            WP_CLI::success('Server addresses: ' . ($ips ? implode(', ', $ips) : 'none found'));
+        } else {
+            $cfg = lg_bb_rl_cfg();
+            $j = lg_bb_rl_read($dir . '/self.php');
+            $d = lg_bb_rl_read($dir . '/cron-denied.php');
+            WP_CLI::line('setting: ' . (!empty($cfg['cron_guard']) ? 'on' : 'off') . ' | file switch: ' . (is_file($off) ? 'OFF (rl/cron-guard-off)' : 'none')
+                . ' | server addresses: ' . (is_array($j) && !empty($j['ips']) ? implode(', ', $j['ips']) : 'none')
+                . ' | last refusal: ' . (is_array($d) && !empty($d['ip']) ? $d['ip'] . ' at ' . gmdate('c', (int) $d['t']) : 'none'));
+        }
+    });
+}
 
 /**
  * Default-on: a wp-config.php or mu-plugin that defines LG_BB_DEFAULT_ON as true makes the first request write a
@@ -1729,9 +1821,18 @@ add_action('admin_post_lg_bb_login', function () {
         $cfg['block_xmlrpc'] = empty($_POST['block_xmlrpc']) ? 0 : 1;
         lg_bb_rl_write(lg_bb_rl_dir() . '/config.php', $cfg);
         $msg = 'Settings saved.';
+    } elseif ($op === 'self_refresh') {
+        $ips = lg_bb_self_refresh(true);
+        $msg = 'Server addresses re-detected: ' . ($ips ? implode(', ', $ips) : 'none found (the wp-cron guard stays out of the way until one is known)') . '.';
     } elseif (in_array($op, ['rate_on', 'rate_off', 'cron_on', 'cron_off'], true)) {
         $key = strpos($op, 'rate') === 0 ? 'rate' : 'cron_guard';
         $cfg[$key] = substr($op, -3) === '_on' ? 1 : 0;
+        if ($op === 'cron_on') {
+            // Turning the guard on starts from a fresh look at the server's own addresses and a clean slate.
+            @unlink(lg_bb_rl_dir() . '/cron-guard-off');
+            @unlink(lg_bb_rl_dir() . '/cron-denied.php');
+            lg_bb_self_refresh(true);
+        }
         foreach (['rate_limit' => 120, 'rate_limit_auth' => 600, 'rate_limit_bot' => 20, 'rate_auto_days' => 1] as $k => $v) {
             if (empty($cfg[$k])) {
                 $cfg[$k] = $v;
@@ -1743,6 +1844,13 @@ add_action('admin_post_lg_bb_login', function () {
         } else {
             $msg = ($key === 'rate' ? 'Request-rate limit' : 'wp-cron guard') . ($cfg[$key] ? ' is on.' : ' is off.');
         }
+    } elseif ($op === 'recommended') {
+        $r = lg_bb_reco_apply();
+        $msg = $r['msg'];
+    } elseif ($op === 'reco_dismiss') {
+        update_user_meta(get_current_user_id(), 'lg_bb_reco_dismissed', 1);
+        wp_safe_redirect(admin_url('index.php'));
+        exit;
     } elseif ($op === 'ua_on' || $op === 'ua_off') {
         $cfg['ua'] = $op === 'ua_on' ? 1 : 0;
         $cfg['ua_load'] = isset($cfg['ua_load']) && $cfg['ua_load'] ? (float) $cfg['ua_load'] : 3.0;
@@ -1841,7 +1949,7 @@ add_action('admin_post_lg_bb_login', function () {
             $msg = $ip . ' reset.';
         }
     }
-    wp_safe_redirect(add_query_arg(['page' => 'lg-blackbox', 'lgmsg' => rawurlencode($msg)], admin_url('tools.php')) . '#lg-login');
+    wp_safe_redirect(add_query_arg(['page' => 'lg-blackbox', 'lgmsg' => rawurlencode($msg)], admin_url('tools.php')) . ($op === 'recommended' ? '#lg-recommended' : '#lg-login'));
     exit;
 });
 
@@ -2521,7 +2629,21 @@ function lg_bb_blocked_panel()
         minutes within an hour put it on the automatic list for <?php echo (int) $acfg['rate_auto_days']; ?> day(s). Never for an allow-listed IP; search crawlers only get the 429.<br>
         wp-cron guard: <strong><?php echo !empty($acfg['cron_guard']) ? 'ON' : 'OFF'; ?></strong>
         (<a href="<?php echo esc_url(lg_bb_ip_action_url(!empty($acfg['cron_guard']) ? 'cron_off' : 'cron_on', '0.0.0.0')); ?>"><?php echo !empty($acfg['cron_guard']) ? 'turn off' : 'turn on'; ?></a>).
-        wp-cron.php answers only the server itself, so nobody else can make WordPress load by calling it.</p>
+        wp-cron.php answers only the server itself, so nobody else can make WordPress load by calling it.<br>
+        <?php
+        $selfj = lg_bb_rl_read(lg_bb_rl_dir() . '/self.php');
+        $deny = lg_bb_rl_read(lg_bb_rl_dir() . '/cron-denied.php');
+        ?>
+        Server addresses the guard lets through: <strong><?php echo esc_html(is_array($selfj) && !empty($selfj['ips']) ? implode(', ', (array) $selfj['ips']) : 'none known (guard inactive)'); ?></strong>
+        (<a href="<?php echo esc_url(lg_bb_ip_action_url('self_refresh', '0.0.0.0')); ?>">re-detect</a>).
+        <?php if (is_file(lg_bb_rl_dir() . '/cron-guard-off')): ?>
+            <br><strong>The guard is switched off by the file rl/cron-guard-off</strong> (delete it, or press &laquo;turn on&raquo;, to bring it back).
+        <?php endif; ?>
+        <?php if (is_array($deny) && !empty($deny['ip'])): ?>
+            <br>Last cron call refused: <code><?php echo esc_html($deny['ip']); ?></code> at <?php echo esc_html(gmdate('Y-m-d H:i', (int) $deny['t'])); ?> UTC.
+            If that is this server, press &laquo;re-detect&raquo; or &laquo;turn off&raquo;.
+        <?php endif; ?>
+        <br><small>Emergency, without WordPress: <code>wp lg-bb cron-guard off</code>, or create an empty file <code>wp-content/lg-blackbox/rl/cron-guard-off</code>, or define <code>LG_BB_CRON_GUARD_OFF</code> as true in wp-config.php.</small></p>
     <?php if ($overs): ?>
         <table class="widefat striped" style="max-width:900px;margin-bottom:1em">
             <thead><tr><th>IP</th><th>Minutes over the limit (last hour)</th><th>Last</th><th>Path</th><th></th></tr></thead>
@@ -3335,6 +3457,8 @@ function lg_bb_page()
             <a class="button" href="<?php echo esc_url($url('lg_bb_clear')); ?>"
                 onclick="return confirm('Delete the log?')">Clear</a>
         </p>
+
+        <?php lg_bb_reco_panel(); ?>
 
         <h2>Report to paste into Claude</h2>
         <?php
